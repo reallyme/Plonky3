@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Lagrange interpolation over structured (two-adic coset) and arbitrary evaluation domains.
 //!
 //! Evaluates polynomials at out-of-domain points given their evaluations on the chosen domain.
@@ -51,6 +55,8 @@ use p3_util::log2_strict_usize;
 
 use crate::Matrix;
 use crate::dense::RowMajorMatrix;
+#[cfg(feature = "secret-memory")]
+use crate::secret::{SecretMatrixError, ZeroizingOwner};
 
 /// Subtract z^{-1} from each inverse denominator to produce adjusted barycentric weights.
 ///
@@ -260,6 +266,67 @@ pub trait Interpolate<F: TwoAdicField>: Matrix<F> {
         // Phase 3: Apply the global scalar to every column result.
         scale_slice_in_place_single_core(&mut evals, scaling_factor);
         evals
+    }
+
+    /// Evaluate every column while guarding partial column sums from memory
+    /// remanence.
+    ///
+    /// The returned evaluations are intentionally disclosed PCS claims. The
+    /// accumulation buffer is not: it contains partial linear combinations of
+    /// private matrix rows, so it is allocated under a zeroizing owner before
+    /// the first row is consumed and copied out only after interpolation is
+    /// complete.
+    #[cfg(feature = "secret-memory")]
+    fn interpolate_coset_with_precomputation_secret<EF>(
+        &self,
+        shift: F,
+        point: EF,
+        adjusted_weights: &[EF],
+    ) -> Result<Vec<EF>, SecretMatrixError>
+    where
+        EF: ExtensionField<F> + zeroize::Zeroize,
+    {
+        let height = self.height();
+        let width = self.width();
+        if height == 0
+            || width == 0
+            || !height.is_power_of_two()
+            || adjusted_weights.len() != height
+            || point.is_zero()
+        {
+            return Err(SecretMatrixError::InvalidShape);
+        }
+
+        let log_height = log2_strict_usize(height);
+        let log_height_u64 =
+            u64::try_from(log_height).map_err(|_| SecretMatrixError::DimensionOverflow)?;
+        let z_pow_n = point.exp_power_of_2(log_height);
+        let g_pow_n = shift.exp_power_of_2(log_height);
+        let denom_inv = g_pow_n.mul_2exp_u64(log_height_u64).inverse();
+        let scaling_factor = point * (z_pow_n - g_pow_n) * denom_inv;
+
+        let mut accumulator_values = Vec::new();
+        accumulator_values
+            .try_reserve_exact(width)
+            .map_err(|_| SecretMatrixError::AllocationFailed)?;
+        accumulator_values.resize(width, EF::ZERO);
+        let mut accumulator = ZeroizingOwner::new(accumulator_values);
+        for (row, &scale) in self.rows().zip(adjusted_weights) {
+            for (sum, value) in accumulator.iter_mut().zip(row) {
+                *sum += scale * value;
+            }
+        }
+        for value in accumulator.iter_mut() {
+            *value *= scaling_factor;
+        }
+
+        let mut disclosed = Vec::new();
+        disclosed
+            .try_reserve_exact(width)
+            .map_err(|_| SecretMatrixError::AllocationFailed)?;
+        disclosed.extend_from_slice(&accumulator);
+        zeroize::Zeroize::zeroize(&mut accumulator);
+        Ok(disclosed)
     }
 }
 
@@ -637,6 +704,80 @@ mod tests {
         // The precomputation variant must produce the same result.
         let result = evals_mat.interpolate_coset_with_precomputation(shift, point, &adjusted);
         assert_eq!(result, vec![F::from_u16(10203)]);
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_precomputed_coset_interpolation_matches_ordinary_multicolumn_result() {
+        let shift = F::GENERATOR;
+        let point = EF4::from(F::from_u16(100));
+        let first_coefficients = [3, 2, 1].map(F::from_u32);
+        let second_coefficients = [11, 7, 5, 2].map(F::from_u32);
+        let first_evaluations: Vec<F> = eval_poly_on_coset(&first_coefficients, shift, 3);
+        let second_evaluations: Vec<F> = eval_poly_on_coset(&second_coefficients, shift, 3);
+        let mut interleaved = Vec::with_capacity(
+            first_evaluations
+                .len()
+                .checked_mul(2)
+                .expect("test matrix length must fit"),
+        );
+        for (first, second) in first_evaluations.iter().zip(&second_evaluations) {
+            interleaved.extend([*first, *second]);
+        }
+        let evaluations = RowMajorMatrix::new(interleaved, 2);
+
+        let height = evaluations.height();
+        let log_height = log2_strict_usize(height);
+        let coset = F::two_adic_generator(log_height)
+            .shifted_powers(shift)
+            .collect_n(height);
+        let denominators: Vec<_> = coset.iter().map(|&value| point - value).collect();
+        let inverse_denominators = batch_multiplicative_inverse(&denominators);
+        let adjusted_weights = compute_adjusted_weights(point, &inverse_denominators);
+
+        let ordinary =
+            evaluations.interpolate_coset_with_precomputation(shift, point, &adjusted_weights);
+        let guarded = evaluations
+            .interpolate_coset_with_precomputation_secret(shift, point, &adjusted_weights)
+            .expect("valid guarded interpolation must succeed");
+
+        assert_eq!(guarded, ordinary);
+        assert_eq!(
+            guarded,
+            vec![
+                eval_poly(&first_coefficients, point),
+                eval_poly(&second_coefficients, point),
+            ]
+        );
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_precomputed_coset_interpolation_rejects_invalid_inputs() {
+        use crate::secret::SecretMatrixError;
+
+        let evaluations = RowMajorMatrix::new(vec![F::ONE; 8], 1);
+        let shift = F::GENERATOR;
+        let point = EF4::from(F::from_u16(100));
+
+        assert_eq!(
+            evaluations.interpolate_coset_with_precomputation_secret(shift, point, &[EF4::ONE; 7],),
+            Err(SecretMatrixError::InvalidShape)
+        );
+        assert_eq!(
+            evaluations.interpolate_coset_with_precomputation_secret(
+                shift,
+                EF4::ZERO,
+                &[EF4::ONE; 8],
+            ),
+            Err(SecretMatrixError::InvalidShape)
+        );
+
+        let zero_width = RowMajorMatrix::<F>::new(Vec::new(), 0);
+        assert_eq!(
+            zero_width.interpolate_coset_with_precomputation_secret(shift, point, &[],),
+            Err(SecretMatrixError::InvalidShape)
+        );
     }
 
     #[test]

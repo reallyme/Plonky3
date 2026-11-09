@@ -1,3 +1,7 @@
+<!-- Modified by ReallyMe Technologies Limited, 2026. -->
+<!-- SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited -->
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+
 # Changelog
 
 All notable changes to this project will be documented in this file.
@@ -6,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+- Add a zeroizing incremental-hasher contract for secret-memory consumers.
 ## [0.8.0] - 2026-09-23
 ### Merged PRs
 - Perf(merkle-tree): reach the vectorized Keccak from the Merkle tree (#2051)
@@ -60,4 +65,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - AngusG
 - Himess
 - Thomas Coratger
-

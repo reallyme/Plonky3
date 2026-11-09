@@ -1,3 +1,7 @@
+# Modified by ReallyMe Technologies Limited, 2026.
+# SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "p3-baby-bear"
 description = "An implementation of the Babybear prime field F_p, where p = 2^31 - 2^27 + 1."
@@ -8,6 +12,9 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
+
+[features]
+secret-memory = ["p3-field/secret-memory", "p3-monty-31/secret-memory"]
 
 [dependencies]
 p3-field.workspace = true
@@ -29,6 +36,7 @@ num-bigint.workspace = true
 proptest.workspace = true
 rand.workspace = true
 rand_xoshiro.workspace = true
+zeroize.workspace = true
 
 [[bench]]
 name = "bench_field"

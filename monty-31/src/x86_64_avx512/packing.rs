@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Optimised AVX512 implementation for packed vectors of MontyFields31 elements.
 //!
 //! We check that this compiles to the expected assembly code in: https://godbolt.org/z/Mz1WGYKWe
@@ -46,6 +50,13 @@ const EVENS_8: __mmask8 = 0b01010101;
 #[repr(transparent)] // Needed to make `transmute`s safe.
 #[must_use]
 pub struct PackedMontyField31AVX512<PMP: PackedMontyParameters>(pub [MontyField31<PMP>; WIDTH]);
+
+#[cfg(feature = "secret-memory")]
+impl<PMP: PackedMontyParameters> zeroize::Zeroize for PackedMontyField31AVX512<PMP> {
+    fn zeroize(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
 
 impl<PMP: PackedMontyParameters> PackedMontyField31AVX512<PMP> {
     #[inline]

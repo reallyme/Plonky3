@@ -1,8 +1,16 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use alloc::vec::Vec;
 use core::fmt::Debug;
 
+#[cfg(feature = "secret-memory")]
+use p3_commit::SecretProverData;
 use p3_field::{ExtensionField, Field};
 use p3_matrix::Matrix;
+#[cfg(feature = "secret-memory")]
+use p3_matrix::dense::{RowMajorMatrix, RowMajorMatrixView};
 use p3_security::fri::FriRegime;
 use p3_security::grinding::GrindingSites;
 
@@ -10,6 +18,18 @@ use p3_security::grinding::GrindingSites;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum FriProverError {
+    #[error("FRI PCS opening metadata allocation failed")]
+    AllocationFailed,
+    #[error("FRI PCS opening batch contains no matrices")]
+    EmptyOpeningBatch,
+    #[error("FRI PCS opening request shape is inconsistent")]
+    OpeningRequestShapeMismatch,
+    #[error("FRI PCS opening domain cannot be constructed")]
+    OpeningDomainUnavailable,
+    #[error("FRI PCS opening height exceeds the field two-adicity")]
+    OpeningHeightUnsupported,
+    #[error("FRI PCS interpolation weight table is inconsistent")]
+    OpeningWeightTableMismatch,
     #[error(
         "FRI input log height {log_input_height} must exceed terminal log height {log_final_height}"
     )]
@@ -27,6 +47,12 @@ pub enum FriProverError {
         "batch {batch}, matrix {matrix}: opened at no points; its width cannot be authenticated"
     )]
     MatrixWithoutOpeningPoints { batch: usize, matrix: usize },
+    #[error("FRI opening batch width overflows its challenge exponent")]
+    OpeningBatchWidthOverflow,
+    #[error("FRI opening denominator table is inconsistent")]
+    OpeningDenominatorTableMismatch,
+    #[error("FRI opening point is unsupported by the interpolation path")]
+    OpeningPointUnsupported,
 }
 
 /// A set of parameters defining a specific instance of the FRI protocol.
@@ -255,6 +281,30 @@ pub trait FriFoldingStrategy<F: Field, EF: ExtensionField<F>> {
     /// Fold an entire matrix with the specified arity.
     /// The matrix has width `2^log_arity` and the result has length `matrix.height()`.
     fn fold_matrix<M: Matrix<EF>>(&self, beta: EF, log_arity: usize, m: M) -> Vec<EF>;
+}
+
+/// FRI folding that places every secret-derived output allocation under an
+/// erasing owner before the first value is written.
+///
+/// This is deliberately separate from [`FriFoldingStrategy`]. Wrapping the
+/// ordinary method's returned `Vec` would leave its construction and unwind
+/// path outside the secret-memory ownership contract.
+#[cfg(feature = "secret-memory")]
+pub trait SecretFriFoldingStrategy<F, EF>: FriFoldingStrategy<F, EF>
+where
+    F: Field,
+    EF: ExtensionField<F> + zeroize::Zeroize,
+{
+    /// Typed failure while validating or constructing a guarded fold.
+    type SecretFoldError: Debug;
+
+    /// Fold one row-major codeword into a guarded single-column matrix.
+    fn fold_matrix_secret(
+        &self,
+        beta: EF,
+        log_arity: usize,
+        matrix: RowMajorMatrixView<'_, EF>,
+    ) -> Result<SecretProverData<RowMajorMatrix<EF>>, Self::SecretFoldError>;
 }
 
 /// Computes the log_arity for the current round.

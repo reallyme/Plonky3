@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use alloc::borrow::Cow;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -32,6 +36,20 @@ pub struct DenseMatrix<T, V = Vec<T>> {
     ///
     /// Required to retain type information when `V` does not own or contain `T`.
     _phantom: PhantomData<T>,
+}
+
+#[cfg(feature = "secret-memory")]
+impl<T, V> zeroize::Zeroize for DenseMatrix<T, V>
+where
+    T: zeroize::Zeroize,
+    V: BorrowMut<[T]>,
+{
+    fn zeroize(&mut self) {
+        for value in self.values.borrow_mut().iter_mut() {
+            zeroize::Zeroize::zeroize(value);
+        }
+        zeroize::Zeroize::zeroize(&mut self.width);
+    }
 }
 
 pub type RowMajorMatrix<T> = DenseMatrix<T>;

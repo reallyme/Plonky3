@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use alloc::vec::Vec;
 use core::iter;
 use core::marker::PhantomData;
@@ -37,6 +41,16 @@ where
 impl<F, EF, Inner> FlatMatrixView<F, EF, Inner> {
     pub const fn new(inner: Inner) -> Self {
         Self(inner, PhantomData)
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<F, EF, Inner> zeroize::Zeroize for FlatMatrixView<F, EF, Inner>
+where
+    Inner: zeroize::Zeroize,
+{
+    fn zeroize(&mut self) {
+        self.0.zeroize();
     }
 }
 

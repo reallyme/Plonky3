@@ -1,3 +1,7 @@
+# Modified by ReallyMe Technologies Limited, 2026.
+# SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [workspace]
 resolver = "2"
 members = [
@@ -116,6 +120,7 @@ tracing-forest = "0.3.1"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = [
     "alloc",
 ] }
+zeroize = { version = "1.8.1", default-features = false, features = ["alloc"] }
 
 # Local dependencies
 p3-air = { path = "air", version = "0.8.0" }

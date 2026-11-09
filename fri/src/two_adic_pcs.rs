@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The FRI PCS protocol over two-adic fields.
 //!
 //! The following implements a slight variant of the usual FRI protocol. As usual we start
@@ -21,26 +25,47 @@ use core::marker::PhantomData;
 
 use itertools::{Itertools, izip};
 use p3_challenger::{CanObserve, FieldChallenger, GrindingChallenger};
+#[cfg(feature = "secret-memory")]
+use p3_commit::PolynomialSpace;
 use p3_commit::{
     CommitmentOpening, Mmcs, OpenedValues, OpeningRequest, Pcs, PeriodicLdeTable,
     UnivariateStarkPcs,
 };
+#[cfg(feature = "secret-memory")]
+use p3_commit::{
+    SecretDetachedPcsCommitter, SecretGeneratedQuotientCommitError,
+    SecretGeneratedQuotientCommitmentResult, SecretMmcs, SecretOpeningRequest, SecretPcsCommitter,
+    SecretPcsMixedOpener, SecretPcsMixedOpeningRequest, SecretPcsOpener, SecretProverData,
+    SecretQuotientCommitmentInput, SecretQuotientCommitmentPlan, SecretRecomputableMmcs,
+    SecretStreamingMmcsCommitment, SecretStreamingRecomputableMmcs,
+    SecretUnivariateStarkPcsCommitter, SecretUnivariateStarkPcsEvaluator,
+};
 use p3_dft::TwoAdicSubgroupDft;
+#[cfg(feature = "secret-memory")]
+use p3_dft::{SecretDftError, SecretTwoAdicSubgroupDft};
 use p3_field::coset::TwoAdicMultiplicativeCoset;
 use p3_field::{
-    ExtensionField, HornerIter, PackedFieldExtension, PackedValue, PrimeCharacteristicRing,
+    ExtensionField, Field, HornerIter, PackedFieldExtension, PackedValue, PrimeCharacteristicRing,
     PrimeField64, TwoAdicField, batch_multiplicative_inverse, batch_multiplicative_inverse_map,
     dot_product,
 };
-use p3_matrix::Matrix;
 use p3_matrix::bitrev::{BitReversedMatrixView, BitReversibleMatrix};
-use p3_matrix::dense::{RowMajorMatrix, RowMajorMatrixCow};
+use p3_matrix::dense::{RowMajorMatrix, RowMajorMatrixCow, RowMajorMatrixView};
 use p3_matrix::interpolation::{Interpolate, compute_adjusted_weights};
+#[cfg(feature = "secret-memory")]
+use p3_matrix::secret::SecretMatrixError;
+#[cfg(feature = "secret-memory")]
+use p3_matrix::util::reverse_matrix_index_bits;
+use p3_matrix::{Dimensions, Matrix};
 use p3_maybe_rayon::prelude::*;
 use p3_util::linear_map::LinearMap;
 use p3_util::{log2_strict_usize, reverse_bits_len, reverse_slice_index_bits};
 use tracing::{debug_span, instrument};
 
+#[cfg(feature = "secret-memory")]
+use crate::SecretFriFoldingStrategy;
+#[cfg(feature = "secret-memory")]
+use crate::pcs_transcript::SecretPcsProverTranscriptError;
 use crate::periodic::build_periodic_lde_table_two_adic;
 use crate::verifier::{self, FriError};
 use crate::{
@@ -67,6 +92,336 @@ pub struct TwoAdicFriPcs<Val, Dft, InputMmcs, FriMmcs> {
     #[cfg(test)]
     pub(crate) forged_fold_schedule: Option<Vec<usize>>,
     _phantom: PhantomData<Val>,
+}
+
+/// Failure while constructing a guarded two-adic PCS commitment.
+#[cfg(feature = "secret-memory")]
+#[derive(Debug, thiserror::Error)]
+pub enum SecretFriCommitError<MmcsError> {
+    /// A shared quotient commitment must contain at least one instance.
+    #[error("secret PCS quotient batch is empty")]
+    EmptyQuotientBatch,
+    /// The eager adapter did not supply the quotient described by its own plan.
+    #[error("secret PCS quotient batch input count does not match its plan")]
+    QuotientCountMismatch,
+    /// An evaluation matrix height disagrees with its declared domain.
+    #[error("secret PCS matrix height does not match its domain")]
+    DomainHeightMismatch,
+    /// The vector retaining guarded LDE matrices could not be reserved.
+    #[error("secret PCS LDE owner allocation failed")]
+    AllocationFailed,
+    /// The quotient chunk count is zero, not a power of two, or larger than the domain.
+    #[error("secret PCS quotient chunk count is invalid")]
+    InvalidQuotientChunkCount,
+    /// A guarded quotient matrix has invalid or overflowing dimensions.
+    #[error("secret PCS quotient matrix is invalid")]
+    Matrix(#[from] SecretMatrixError),
+    /// The guarded DFT rejected the input or could not allocate its output.
+    #[error("secret PCS DFT failed")]
+    Dft(SecretDftError),
+    /// The guarded MMCS rejected commitment construction.
+    #[error("secret PCS MMCS commitment failed")]
+    Mmcs(MmcsError),
+    /// Retained compact data was produced for a different PCS blowup.
+    #[error("secret PCS retained-data blowup does not match the PCS configuration")]
+    RetainedBlowupMismatch,
+    /// Retained compact data contains no coefficient matrices.
+    #[error("secret PCS retained coefficient set is empty")]
+    EmptyRetainedCoefficients,
+    /// The requested retained coefficient matrix is absent.
+    #[error("secret PCS retained matrix index is out of bounds")]
+    MatrixIndexOutOfBounds { index: usize, matrix_count: usize },
+    /// Committed matrices were already replaced by authentication-only state.
+    #[error("secret PCS commitment data is already detached")]
+    CommitmentAlreadyDetached,
+}
+
+/// Failure while evaluating guarded PCS data on another two-adic domain.
+#[cfg(feature = "secret-memory")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum SecretFriEvaluationError {
+    /// Retained compact data was produced for a different PCS blowup.
+    #[error("secret PCS retained-data blowup does not match the PCS configuration")]
+    RetainedBlowupMismatch,
+    /// The requested matrix is absent from the guarded commitment.
+    #[error("secret PCS matrix index is out of bounds")]
+    MatrixIndexOutOfBounds { index: usize, matrix_count: usize },
+    /// The retained coefficient matrix has an invalid shape.
+    #[error("secret PCS retained coefficient matrix is invalid")]
+    Matrix(#[from] SecretMatrixError),
+    /// The guarded DFT rejected the requested evaluation.
+    #[error("secret PCS domain evaluation DFT failed")]
+    Dft(SecretDftError),
+}
+
+/// Failure while folding a secret-derived FRI codeword.
+#[cfg(feature = "secret-memory")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum SecretFriFoldError {
+    /// FRI folds must reduce by an arity of at least two.
+    #[error("secret FRI fold arity is zero")]
+    ZeroLogArity,
+    /// The requested fold arity cannot be represented by `usize`.
+    #[error("secret FRI fold arity overflows usize")]
+    ArityOverflow,
+    /// The input is not a nonempty row-major matrix of the requested arity.
+    #[error("secret FRI fold matrix shape is invalid")]
+    InvalidMatrixShape,
+    /// The codeword domain exceeds the base field's two-adicity.
+    #[error("secret FRI fold domain exceeds field two-adicity")]
+    UnsupportedDomain,
+    /// A guarded fold buffer could not be allocated.
+    #[error("secret FRI fold allocation failed")]
+    AllocationFailed,
+}
+
+/// Failure while constructing a complete guarded two-adic PCS opening proof.
+#[cfg(feature = "secret-memory")]
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SecretFriOpenError<InputMmcsError, FriMmcsError> {
+    /// Opening geometry or quotient reduction failed.
+    #[error("guarded PCS opening preparation failed")]
+    Preparation(FriProverError),
+    /// A guarded reduced-opening allocation or shape operation failed.
+    #[error("guarded PCS opening matrix operation failed")]
+    Matrix(SecretMatrixError),
+    /// Public proof metadata could not be reserved.
+    #[error("guarded PCS opening allocation failed")]
+    AllocationFailed,
+    /// Full input matrices could not transition to authentication-only state.
+    #[error("guarded PCS input detachment failed")]
+    InputDetachment(SecretFriCommitError<InputMmcsError>),
+    /// A detached input matrix could not be reconstructed for quotient reduction.
+    #[error("guarded PCS input reconstruction failed")]
+    InputReconstruction(SecretFriCommitError<InputMmcsError>),
+    /// The guarded FRI protocol failed.
+    #[error("guarded PCS FRI proof construction failed")]
+    Fri(
+        prover::SecretFriDriverError<
+            SecretFriCommitError<InputMmcsError>,
+            FriMmcsError,
+            SecretFriFoldError,
+        >,
+    ),
+    /// The outer PCS transcript did not close cleanly.
+    #[error("guarded PCS transcript finalization failed")]
+    Transcript(SecretPcsProverTranscriptError),
+}
+
+/// Stable public failure categories for guarded two-adic PCS opening.
+///
+/// The internal driver retains more detailed typed errors, but those types are
+/// implementation details spanning the FRI transcript, folding strategy, and
+/// MMCS. Keeping this boundary categorical prevents downstream protocols from
+/// coupling their error ABI to those internals.
+#[cfg(feature = "secret-memory")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum SecretTwoAdicPcsOpenError {
+    /// Opening geometry or quotient reduction was rejected.
+    #[error("guarded PCS opening preparation failed")]
+    Preparation,
+    /// A guarded opening matrix operation failed.
+    #[error("guarded PCS opening matrix operation failed")]
+    Matrix,
+    /// Public proof metadata could not be reserved.
+    #[error("guarded PCS opening allocation failed")]
+    AllocationFailed,
+    /// Full input matrices could not transition to authentication-only state.
+    #[error("guarded PCS input detachment failed")]
+    InputDetachment,
+    /// A detached input matrix could not be reconstructed for quotient reduction.
+    #[error("guarded PCS input reconstruction failed")]
+    InputReconstruction,
+    /// Guarded FRI proof construction failed.
+    #[error("guarded PCS FRI proof construction failed")]
+    Fri,
+    /// The guarded PCS transcript did not close cleanly.
+    #[error("guarded PCS transcript finalization failed")]
+    Transcript,
+}
+
+#[cfg(feature = "secret-memory")]
+impl<InputMmcsError, FriMmcsError> From<SecretFriOpenError<InputMmcsError, FriMmcsError>>
+    for SecretTwoAdicPcsOpenError
+{
+    fn from(error: SecretFriOpenError<InputMmcsError, FriMmcsError>) -> Self {
+        match error {
+            SecretFriOpenError::Preparation(_) => Self::Preparation,
+            SecretFriOpenError::Matrix(_) => Self::Matrix,
+            SecretFriOpenError::AllocationFailed => Self::AllocationFailed,
+            SecretFriOpenError::InputDetachment(_) => Self::InputDetachment,
+            SecretFriOpenError::InputReconstruction(_) => Self::InputReconstruction,
+            SecretFriOpenError::Fri(_) => Self::Fri,
+            SecretFriOpenError::Transcript(_) => Self::Transcript,
+        }
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<InputMmcsError, FriMmcsError> From<FriProverError>
+    for SecretFriOpenError<InputMmcsError, FriMmcsError>
+{
+    fn from(error: FriProverError) -> Self {
+        Self::Preparation(error)
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<InputMmcsError, FriMmcsError> From<SecretMatrixError>
+    for SecretFriOpenError<InputMmcsError, FriMmcsError>
+{
+    fn from(error: SecretMatrixError) -> Self {
+        Self::Matrix(error)
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<InputMmcsError, FriMmcsError> From<SecretFriCommitError<InputMmcsError>>
+    for SecretFriOpenError<InputMmcsError, FriMmcsError>
+{
+    fn from(error: SecretFriCommitError<InputMmcsError>) -> Self {
+        Self::InputReconstruction(error)
+    }
+}
+
+/// A guarded batch of secret-derived row-major matrices.
+///
+/// The nested owners let callers erase each matrix as soon as its final
+/// consumer finishes without extracting any backing allocation.
+#[cfg(feature = "secret-memory")]
+pub type SecretMatrixBatch<F> = SecretProverData<Vec<SecretProverData<RowMajorMatrix<F>>>>;
+
+#[cfg(feature = "secret-memory")]
+type SecretTwoAdicFriProverData<Val, InputMmcs> = SecretProverData<
+    SecretTwoAdicFriData<
+        Val,
+        <InputMmcs as SecretMmcs<Val>>::SecretData<RowMajorMatrix<Val>>,
+        <InputMmcs as SecretRecomputableMmcs<Val>>::AuthenticationData<RowMajorMatrix<Val>>,
+    >,
+>;
+
+/// Guarded two-adic PCS data retaining both the live commitment and the
+/// compact coefficients needed to reconstruct queried LDE rows.
+///
+/// This type deliberately has no `Clone`, `Debug`, or serialization support.
+/// The coefficient matrices are witness-derived and remain behind nested
+/// zeroizing owners until opening construction is complete.
+#[cfg(feature = "secret-memory")]
+pub struct SecretTwoAdicFriData<F, D, A>
+where
+    F: zeroize::Zeroize,
+    D: zeroize::Zeroize,
+    A: zeroize::Zeroize,
+{
+    pub(crate) commitment_data: SecretProverData<D>,
+    pub(crate) authentication_data: Option<A>,
+    coefficients: SecretMatrixBatch<F>,
+    log_blowup: usize,
+}
+
+#[cfg(feature = "secret-memory")]
+impl<F, D, A> zeroize::Zeroize for SecretTwoAdicFriData<F, D, A>
+where
+    F: zeroize::Zeroize,
+    D: zeroize::Zeroize,
+    A: zeroize::Zeroize,
+{
+    fn zeroize(&mut self) {
+        self.commitment_data.zeroize();
+        if let Some(authentication_data) = self.authentication_data.as_mut() {
+            authentication_data.zeroize();
+        }
+        self.coefficients.zeroize();
+        self.log_blowup.zeroize();
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<F, D, A> SecretTwoAdicFriData<F, D, A>
+where
+    F: TwoAdicField + zeroize::Zeroize,
+    D: zeroize::Zeroize,
+    A: zeroize::Zeroize,
+{
+    pub(crate) fn new(
+        commitment_data: SecretProverData<D>,
+        coefficients: Vec<SecretProverData<RowMajorMatrix<F>>>,
+        log_blowup: usize,
+    ) -> Self {
+        Self {
+            commitment_data,
+            authentication_data: None,
+            coefficients: SecretProverData::new(coefficients),
+            log_blowup,
+        }
+    }
+
+    pub(crate) fn new_detached(
+        commitment_data: SecretProverData<D>,
+        authentication_data: A,
+        coefficients: Vec<SecretProverData<RowMajorMatrix<F>>>,
+        log_blowup: usize,
+    ) -> Self {
+        Self {
+            commitment_data,
+            authentication_data: Some(authentication_data),
+            coefficients: SecretProverData::new(coefficients),
+            log_blowup,
+        }
+    }
+
+    fn max_lde_height(&self) -> Result<usize, SecretMatrixError> {
+        let shift =
+            u32::try_from(self.log_blowup).map_err(|_| SecretMatrixError::DimensionOverflow)?;
+        let mut maximum = None;
+        for coefficients in self.coefficients.iter() {
+            let width = coefficients.width;
+            if width == 0 || !coefficients.values.len().is_multiple_of(width) {
+                return Err(SecretMatrixError::InvalidShape);
+            }
+            let coefficient_height = coefficients.values.len() / width;
+            if coefficient_height == 0 || !coefficient_height.is_power_of_two() {
+                return Err(SecretMatrixError::InvalidShape);
+            }
+            let height = coefficient_height
+                .checked_shl(shift)
+                .ok_or(SecretMatrixError::DimensionOverflow)?;
+            maximum = Some(maximum.map_or(height, |current: usize| current.max(height)));
+        }
+        maximum.ok_or(SecretMatrixError::InvalidShape)
+    }
+
+    /// Return committed LDE dimensions from compact retained coefficients.
+    ///
+    /// These dimensions remain authoritative after Merkle value leaves have
+    /// been erased. Opening preflight must therefore use this source rather
+    /// than treating live MMCS matrices as persistent shape metadata.
+    pub(crate) fn retained_lde_dimensions(&self) -> Result<Vec<Dimensions>, SecretMatrixError> {
+        let shift =
+            u32::try_from(self.log_blowup).map_err(|_| SecretMatrixError::DimensionOverflow)?;
+        let mut dimensions = Vec::new();
+        dimensions
+            .try_reserve_exact(self.coefficients.len())
+            .map_err(|_| SecretMatrixError::AllocationFailed)?;
+        for coefficients in self.coefficients.iter() {
+            let width = coefficients.width;
+            if width == 0 || !coefficients.values.len().is_multiple_of(width) {
+                return Err(SecretMatrixError::InvalidShape);
+            }
+            let coefficient_height = coefficients.values.len() / width;
+            if coefficient_height == 0 || !coefficient_height.is_power_of_two() {
+                return Err(SecretMatrixError::InvalidShape);
+            }
+            let height = coefficient_height
+                .checked_shl(shift)
+                .ok_or(SecretMatrixError::DimensionOverflow)?;
+            dimensions.push(Dimensions { width, height });
+        }
+        if dimensions.is_empty() {
+            return Err(SecretMatrixError::InvalidShape);
+        }
+        Ok(dimensions)
+    }
 }
 
 impl<Val, Dft, InputMmcs, FriMmcs> TwoAdicFriPcs<Val, Dft, InputMmcs, FriMmcs> {
@@ -136,9 +491,412 @@ where
     }
 }
 
+#[cfg(feature = "secret-memory")]
+impl<Val, Dft, InputMmcs, FriMmcs> TwoAdicFriPcs<Val, Dft, InputMmcs, FriMmcs>
+where
+    Val: TwoAdicField + PrimeField64 + zeroize::Zeroize,
+    Dft: TwoAdicSubgroupDft<Val> + SecretTwoAdicSubgroupDft<Val> + Sync,
+    InputMmcs: Mmcs<Val> + SecretRecomputableMmcs<Val>,
+    InputMmcs::AuthenticationData<RowMajorMatrix<Val>>: zeroize::Zeroize,
+{
+    /// Rebuild one complete committed LDE under a zeroizing owner.
+    ///
+    /// This capability is intentionally matrix-scoped. Opening code can
+    /// reconstruct, reduce, and erase each matrix in turn instead of reviving
+    /// an entire commitment batch and recreating the memory peak that early
+    /// detachment is meant to remove.
+    pub fn recompute_lde_matrix_secret(
+        &self,
+        prover_data: &SecretTwoAdicFriProverData<Val, InputMmcs>,
+        index: usize,
+    ) -> Result<SecretProverData<RowMajorMatrix<Val>>, SecretFriCommitError<InputMmcs::SecretError>>
+    {
+        if prover_data.log_blowup != self.fri.log_blowup {
+            return Err(SecretFriCommitError::RetainedBlowupMismatch);
+        }
+        let matrix_count = prover_data.coefficients.len();
+        let coefficients = prover_data.coefficients.get(index).ok_or(
+            SecretFriCommitError::MatrixIndexOutOfBounds {
+                index,
+                matrix_count,
+            },
+        )?;
+        self.dft
+            .recompute_coset_lde_secret(coefficients, self.fri.log_blowup)
+            .map_err(SecretFriCommitError::Dft)
+    }
+
+    /// Recompute selected bit-reversed LDE rows from compact guarded
+    /// coefficients retained by [`SecretPcsCommitter::commit_secret`].
+    ///
+    /// `indices` use MMCS batch semantics: they address the tallest matrix and
+    /// are shifted for shorter matrices. Rows are returned matrix-major; each
+    /// matrix follows `indices` order.
+    /// The result stays guarded until the caller intentionally transfers the
+    /// selected rows into an MMCS opening proof.
+    pub fn recompute_lde_rows_secret(
+        &self,
+        prover_data: &SecretTwoAdicFriProverData<Val, InputMmcs>,
+        indices: &[usize],
+    ) -> Result<SecretMatrixBatch<Val>, SecretFriCommitError<InputMmcs::SecretError>> {
+        if prover_data.log_blowup != self.fri.log_blowup {
+            return Err(SecretFriCommitError::RetainedBlowupMismatch);
+        }
+        if prover_data.coefficients.is_empty() {
+            return Err(SecretFriCommitError::EmptyRetainedCoefficients);
+        }
+
+        let blowup_shift =
+            u32::try_from(self.fri.log_blowup).map_err(|_| SecretMatrixError::DimensionOverflow)?;
+        let mut lde_heights = Vec::new();
+        lde_heights
+            .try_reserve_exact(prover_data.coefficients.len())
+            .map_err(|_| SecretFriCommitError::AllocationFailed)?;
+        for coefficients in prover_data.coefficients.iter() {
+            let lde_height = coefficients
+                .height()
+                .checked_shl(blowup_shift)
+                .ok_or(SecretMatrixError::DimensionOverflow)?;
+            lde_heights.push(lde_height);
+        }
+        let max_lde_height = lde_heights
+            .iter()
+            .copied()
+            .max()
+            .ok_or(SecretFriCommitError::EmptyRetainedCoefficients)?;
+        let log_max_lde_height = log2_strict_usize(max_lde_height);
+
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(prover_data.coefficients.len())
+            .map_err(|_| SecretFriCommitError::AllocationFailed)?;
+        for (coefficients, lde_height) in prover_data.coefficients.iter().zip(lde_heights) {
+            let bits_reduced = log_max_lde_height
+                .checked_sub(log2_strict_usize(lde_height))
+                .ok_or(SecretMatrixError::InvalidShape)?;
+            let mut matrix_indices = Vec::new();
+            matrix_indices
+                .try_reserve_exact(indices.len())
+                .map_err(|_| SecretFriCommitError::AllocationFailed)?;
+            for &index in indices {
+                if index >= max_lde_height {
+                    return Err(SecretFriCommitError::Dft(
+                        SecretDftError::QueryIndexOutOfBounds {
+                            index,
+                            height: max_lde_height,
+                        },
+                    ));
+                }
+                matrix_indices.push(index >> bits_reduced);
+            }
+            rows.push(
+                self.dft
+                    .recompute_coset_lde_rows_secret(
+                        coefficients,
+                        self.fri.log_blowup,
+                        &matrix_indices,
+                    )
+                    .map_err(SecretFriCommitError::Dft)?,
+            );
+        }
+        Ok(SecretProverData::new(rows))
+    }
+
+    fn evaluate_on_domain_secret(
+        &self,
+        prover_data: &SecretTwoAdicFriProverData<Val, InputMmcs>,
+        idx: usize,
+        domain: TwoAdicMultiplicativeCoset<Val>,
+    ) -> Result<SecretProverData<RowMajorMatrix<Val>>, SecretFriEvaluationError> {
+        if prover_data.log_blowup != self.fri.log_blowup {
+            return Err(SecretFriEvaluationError::RetainedBlowupMismatch);
+        }
+        let matrix_count = prover_data.coefficients.len();
+        let coefficients = prover_data.coefficients.get(idx).ok_or(
+            SecretFriEvaluationError::MatrixIndexOutOfBounds {
+                index: idx,
+                matrix_count,
+            },
+        )?;
+        let width = coefficients.width;
+        if width == 0 || !coefficients.values.len().is_multiple_of(width) {
+            return Err(SecretMatrixError::InvalidShape.into());
+        }
+        let coefficient_height = coefficients.values.len() / width;
+        if coefficient_height == 0 || !coefficient_height.is_power_of_two() {
+            return Err(SecretMatrixError::InvalidShape.into());
+        }
+
+        let target_height = domain.size();
+        if target_height == 0 || !target_height.is_power_of_two() {
+            return Err(SecretMatrixError::InvalidShape.into());
+        }
+        let output_len = target_height
+            .checked_mul(width)
+            .ok_or(SecretMatrixError::DimensionOverflow)?;
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(output_len)
+            .map_err(|_| SecretMatrixError::AllocationFailed)?;
+        values.resize(output_len, Val::ZERO);
+        let mut evaluations = SecretProverData::new(RowMajorMatrix::new(values, width));
+
+        let blowup_shift =
+            u32::try_from(self.fri.log_blowup).map_err(|_| SecretMatrixError::DimensionOverflow)?;
+        let committed_lde_height = coefficient_height
+            .checked_shl(blowup_shift)
+            .ok_or(SecretMatrixError::DimensionOverflow)?;
+        if domain.shift() == Val::GENERATOR && committed_lde_height >= target_height {
+            // The ordinary PCS takes a bit-reversed prefix in this case. In
+            // coefficient form that is evaluation on a smaller subgroup, so
+            // degrees congruent modulo the target height must be added rather
+            // than discarded.
+            for row in 0..coefficient_height {
+                let source_start = row
+                    .checked_mul(width)
+                    .ok_or(SecretMatrixError::DimensionOverflow)?;
+                let source_end = source_start
+                    .checked_add(width)
+                    .ok_or(SecretMatrixError::DimensionOverflow)?;
+                let destination_row = row % target_height;
+                let destination_start = destination_row
+                    .checked_mul(width)
+                    .ok_or(SecretMatrixError::DimensionOverflow)?;
+                let destination_end = destination_start
+                    .checked_add(width)
+                    .ok_or(SecretMatrixError::DimensionOverflow)?;
+                let destination = evaluations
+                    .values
+                    .get_mut(destination_start..destination_end)
+                    .ok_or(SecretMatrixError::InvalidShape)?;
+                let source = coefficients
+                    .values
+                    .get(source_start..source_end)
+                    .ok_or(SecretMatrixError::InvalidShape)?;
+                for (output, coefficient) in destination.iter_mut().zip(source) {
+                    *output += *coefficient;
+                }
+            }
+        } else {
+            // Retained coefficients describe f(GENERATOR * X). Multiplying
+            // degree j by (domain.shift / GENERATOR)^j converts them to
+            // f(domain.shift * X) before the subgroup DFT. When the target
+            // subgroup is smaller than the retained coefficient domain,
+            // degrees congruent modulo the target height evaluate identically
+            // and therefore must be added. Truncation is not valid here: it
+            // silently drops the hiding polynomial's upper coefficients on
+            // every shifted quotient chunk except the generator coset.
+            let relative_shift = domain.shift() / Val::GENERATOR;
+            let mut row_scale = Val::ONE;
+            for row in 0..coefficient_height {
+                let source_start = row
+                    .checked_mul(width)
+                    .ok_or(SecretMatrixError::DimensionOverflow)?;
+                let source_end = source_start
+                    .checked_add(width)
+                    .ok_or(SecretMatrixError::DimensionOverflow)?;
+                let destination_row = row % target_height;
+                let destination_start = destination_row
+                    .checked_mul(width)
+                    .ok_or(SecretMatrixError::DimensionOverflow)?;
+                let destination_end = destination_start
+                    .checked_add(width)
+                    .ok_or(SecretMatrixError::DimensionOverflow)?;
+                let destination = evaluations
+                    .values
+                    .get_mut(destination_start..destination_end)
+                    .ok_or(SecretMatrixError::InvalidShape)?;
+                let source = coefficients
+                    .values
+                    .get(source_start..source_end)
+                    .ok_or(SecretMatrixError::InvalidShape)?;
+                for (output, coefficient) in destination.iter_mut().zip(source) {
+                    *output += *coefficient * row_scale;
+                }
+                row_scale *= relative_shift;
+            }
+        }
+        self.dft
+            .dft_batch_secret(&mut evaluations)
+            .map_err(SecretFriEvaluationError::Dft)?;
+        Ok(evaluations)
+    }
+
+    /// Evaluate retained coefficients at one disclosed opening point without
+    /// reconstructing the committed LDE.
+    ///
+    /// The retained matrix contains coefficients of `f(GENERATOR * X)` in
+    /// natural degree order. Evaluating it at `point / GENERATOR` therefore
+    /// yields `f(point)`. Horner accumulators remain behind a zeroizing owner;
+    /// only the completed PCS claims are copied into ordinary proof metadata.
+    fn evaluate_coefficients_at_point_secret<Challenge>(
+        coefficients: &SecretProverData<RowMajorMatrix<Val>>,
+        point: Challenge,
+    ) -> Result<Vec<Challenge>, SecretMatrixError>
+    where
+        Challenge: ExtensionField<Val> + zeroize::Zeroize,
+    {
+        let width = coefficients.width;
+        if width == 0 || !coefficients.values.len().is_multiple_of(width) || point.is_zero() {
+            return Err(SecretMatrixError::InvalidShape);
+        }
+        let height = coefficients.values.len() / width;
+        if height == 0 || !height.is_power_of_two() {
+            return Err(SecretMatrixError::InvalidShape);
+        }
+
+        let mut accumulator_values = Vec::new();
+        accumulator_values
+            .try_reserve_exact(width)
+            .map_err(|_| SecretMatrixError::AllocationFailed)?;
+        accumulator_values.resize(width, Challenge::ZERO);
+        let mut accumulators = SecretProverData::new(accumulator_values);
+        let evaluation_point = point * Val::GENERATOR.inverse();
+
+        for row_index in (0..height).rev() {
+            let row = coefficients
+                .row_slice(row_index)
+                .ok_or(SecretMatrixError::InvalidShape)?;
+            for (accumulator, coefficient) in accumulators.iter_mut().zip(row.iter()) {
+                *accumulator = *accumulator * evaluation_point + *coefficient;
+            }
+        }
+
+        let mut disclosed = Vec::new();
+        disclosed
+            .try_reserve_exact(width)
+            .map_err(|_| SecretMatrixError::AllocationFailed)?;
+        disclosed.extend_from_slice(&accumulators);
+        zeroize::Zeroize::zeroize(&mut accumulators);
+        Ok(disclosed)
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<Val, Dft, InputMmcs, FriMmcs> TwoAdicFriPcs<Val, Dft, InputMmcs, FriMmcs>
+where
+    Val: TwoAdicField + PrimeField64 + zeroize::Zeroize,
+    Dft: TwoAdicSubgroupDft<Val> + SecretTwoAdicSubgroupDft<Val> + Sync,
+    InputMmcs: Mmcs<Val> + SecretRecomputableMmcs<Val>,
+    InputMmcs::AuthenticationData<RowMajorMatrix<Val>>: zeroize::Zeroize,
+{
+    /// Erase full committed matrices while retaining Merkle authentication
+    /// state and compact coefficients for the eventual queried-row opening.
+    pub(crate) fn detach_commitment_data_secret(
+        &self,
+        prover_data: &mut SecretTwoAdicFriProverData<Val, InputMmcs>,
+    ) -> Result<(), SecretFriCommitError<InputMmcs::SecretError>> {
+        if prover_data.authentication_data.is_some() {
+            return Err(SecretFriCommitError::CommitmentAlreadyDetached);
+        }
+        let authentication_data = self
+            .mmcs
+            .detach_authentication_data(&mut prover_data.commitment_data)
+            .map_err(SecretFriCommitError::Mmcs)?;
+        prover_data.authentication_data = Some(authentication_data);
+        Ok(())
+    }
+
+    /// Recompute selected LDE rows, erase the full committed matrices, and
+    /// authenticate the rows against the original commitment.
+    ///
+    /// Reconstruction deliberately precedes the irreversible detachment so an
+    /// invalid query cannot destroy otherwise usable prover data. The temporary
+    /// overlap is bounded by `query_count * total_committed_width`, not by an
+    /// additional full LDE. On success the retained MMCS data contains no value
+    /// leaves and cannot service an ordinary opening.
+    pub fn detach_and_open_multi_batch_secret(
+        &self,
+        indices: &[usize],
+        prover_data: &mut SecretTwoAdicFriProverData<Val, InputMmcs>,
+    ) -> Result<BatchMultiOpening<Val, InputMmcs>, SecretFriCommitError<InputMmcs::SecretError>>
+    {
+        let recomputed = self.recompute_lde_rows_secret(prover_data, indices)?;
+        let mut query_rows = Vec::new();
+        query_rows
+            .try_reserve_exact(indices.len())
+            .map_err(|_| SecretFriCommitError::AllocationFailed)?;
+        for query_index in 0..indices.len() {
+            let mut rows_at_index = Vec::new();
+            rows_at_index
+                .try_reserve_exact(recomputed.len())
+                .map_err(|_| SecretFriCommitError::AllocationFailed)?;
+            for matrix in recomputed.iter() {
+                let row = matrix
+                    .row_slice(query_index)
+                    .ok_or(SecretMatrixError::InvalidShape)?;
+                let mut owned_row = Vec::new();
+                owned_row
+                    .try_reserve_exact(row.len())
+                    .map_err(|_| SecretFriCommitError::AllocationFailed)?;
+                owned_row.extend_from_slice(&row);
+                rows_at_index.push(owned_row);
+            }
+            query_rows.push(rows_at_index);
+        }
+
+        if prover_data.authentication_data.is_none() {
+            self.detach_commitment_data_secret(prover_data)?;
+        }
+        let authentication_data = prover_data
+            .authentication_data
+            .as_ref()
+            .ok_or(SecretFriCommitError::CommitmentAlreadyDetached)?;
+        let (opened_values, opening_proof) = self
+            .mmcs
+            .open_multi_batch_from_recomputed_rows::<RowMajorMatrix<Val>>(
+                indices,
+                &query_rows,
+                authentication_data,
+            )
+            .map_err(SecretFriCommitError::Mmcs)?;
+        Ok(BatchMultiOpening {
+            opened_values,
+            opening_proof,
+        })
+    }
+}
+
 /// The Prover Data associated to a commitment to a collection of matrices
 /// and a list of points to open each matrix at.
 pub type ProverDataWithOpeningPoints<'a, EF, ProverData> = OpeningRequest<'a, ProverData, EF>;
+
+#[cfg(feature = "secret-memory")]
+type SecretTwoAdicMixedOpeningRequests<
+    'a,
+    Val,
+    PublicData,
+    SecretInputData,
+    SecretAuthenticationData,
+    Challenge,
+> = Vec<
+    SecretPcsMixedOpeningRequest<
+        'a,
+        PublicData,
+        SecretTwoAdicFriData<Val, SecretInputData, SecretAuthenticationData>,
+        Challenge,
+    >,
+>;
+
+#[cfg(feature = "secret-memory")]
+type SecretTwoAdicPcsMixedOpeningRequests<'a, Val, InputMmcs, Challenge> =
+    SecretTwoAdicMixedOpeningRequests<
+        'a,
+        Val,
+        <InputMmcs as Mmcs<Val>>::ProverData<RowMajorMatrix<Val>>,
+        <InputMmcs as SecretMmcs<Val>>::SecretData<RowMajorMatrix<Val>>,
+        <InputMmcs as SecretRecomputableMmcs<Val>>::AuthenticationData<RowMajorMatrix<Val>>,
+        Challenge,
+    >;
+
+#[cfg(feature = "secret-memory")]
+type SecretTwoAdicOpeningResult<Challenge, FriMmcs, Val, InputMmcs, InputMmcsError, FriMmcsError> =
+    Result<
+        (
+            OpenedValues<Challenge>,
+            FriProof<Challenge, FriMmcs, Val, Vec<BatchMultiOpening<Val, InputMmcs>>>,
+        ),
+        SecretFriOpenError<InputMmcsError, FriMmcsError>,
+    >;
 
 // Re-exported so `p3_fri::CommitmentWithOpeningPoints` keeps naming the shape this PCS
 // verifies against; it is defined in `p3-commit` alongside `Pcs` so crates that build an
@@ -365,6 +1123,142 @@ fn ifft8<F: TwoAdicField, EF: ExtensionField<F>>(
     ]
 }
 
+#[cfg(feature = "secret-memory")]
+fn allocate_secret_fold_matrix<EF>(
+    height: usize,
+) -> Result<SecretProverData<RowMajorMatrix<EF>>, SecretFriFoldError>
+where
+    EF: Field + zeroize::Zeroize,
+{
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(height)
+        .map_err(|_| SecretFriFoldError::AllocationFailed)?;
+    values.resize(height, EF::ZERO);
+    Ok(SecretProverData::new(RowMajorMatrix::new(values, 1)))
+}
+
+#[cfg(feature = "secret-memory")]
+impl<
+    F: TwoAdicField,
+    InputProof: Sync,
+    InputError: Debug + Sync,
+    EF: ExtensionField<F> + zeroize::Zeroize,
+> SecretFriFoldingStrategy<F, EF> for TwoAdicFriFolding<InputProof, InputError>
+{
+    type SecretFoldError = SecretFriFoldError;
+
+    fn fold_matrix_secret(
+        &self,
+        beta: EF,
+        log_arity: usize,
+        matrix: RowMajorMatrixView<'_, EF>,
+    ) -> Result<SecretProverData<RowMajorMatrix<EF>>, Self::SecretFoldError> {
+        if log_arity == 0 {
+            return Err(SecretFriFoldError::ZeroLogArity);
+        }
+        let arity_shift =
+            u32::try_from(log_arity).map_err(|_| SecretFriFoldError::ArityOverflow)?;
+        let arity = 1_usize
+            .checked_shl(arity_shift)
+            .ok_or(SecretFriFoldError::ArityOverflow)?;
+        if matrix.width != arity
+            || matrix.values.is_empty()
+            || !matrix.values.len().is_multiple_of(arity)
+        {
+            return Err(SecretFriFoldError::InvalidMatrixShape);
+        }
+        let height = matrix.values.len() / arity;
+        if !height.is_power_of_two() {
+            return Err(SecretFriFoldError::InvalidMatrixShape);
+        }
+        let log_domain = log2_strict_usize(height)
+            .checked_add(log_arity)
+            .ok_or(SecretFriFoldError::UnsupportedDomain)?;
+        if log_domain > F::TWO_ADICITY {
+            return Err(SecretFriFoldError::UnsupportedDomain);
+        }
+
+        let g_inv = F::two_adic_generator(log_domain).inverse();
+        let initial_height = if log_arity == 1 {
+            height
+        } else {
+            height
+                .checked_mul(arity / 2)
+                .ok_or(SecretFriFoldError::ArityOverflow)?
+        };
+        let mut halve_inv_powers = g_inv
+            .shifted_powers(F::ONE.halve())
+            .collect_n(initial_height);
+        reverse_slice_index_bits(&mut halve_inv_powers);
+
+        if log_arity == 1 {
+            let mut output = allocate_secret_fold_matrix(height)?;
+            output
+                .values
+                .par_iter_mut()
+                .zip(matrix.values.par_chunks_exact(2))
+                .zip(halve_inv_powers)
+                .for_each(|((out, row), halve_inv_power)| {
+                    if let [lo, hi] = row {
+                        *out = (*lo + *hi).halve() + (*lo - *hi) * beta * halve_inv_power;
+                    }
+                });
+            return Ok(output);
+        }
+
+        let pairs_per_row = arity / 2;
+        let mut data = allocate_secret_fold_matrix(initial_height)?;
+        data.values
+            .par_chunks_exact_mut(pairs_per_row)
+            .zip(matrix.values.par_chunks_exact(arity))
+            .zip(halve_inv_powers.par_chunks_exact(pairs_per_row))
+            .for_each(|((output_row, input_row), inverse_powers)| {
+                let (input_pairs, remainder) = input_row.as_chunks::<2>();
+                debug_assert!(remainder.is_empty());
+                for ((out, pair), &halve_inv_power) in
+                    output_row.iter_mut().zip(input_pairs).zip(inverse_powers)
+                {
+                    let [lo, hi] = pair;
+                    *out = (*lo + *hi).halve() + (*lo - *hi) * beta * halve_inv_power;
+                }
+            });
+
+        let mut current_beta = beta.square();
+        let mut next_data = allocate_secret_fold_matrix(initial_height / 2)?;
+        for _ in 1..log_arity {
+            let next_height = data.values.len() / 2;
+            let output = next_data
+                .values
+                .get_mut(..next_height)
+                .ok_or(SecretFriFoldError::InvalidMatrixShape)?;
+            let inverse_powers = halve_inv_powers
+                .get(..next_height)
+                .ok_or(SecretFriFoldError::InvalidMatrixShape)?;
+            output
+                .par_iter_mut()
+                .zip(data.values.par_chunks_exact(2))
+                .zip(inverse_powers)
+                .for_each(|((out, pair), &halve_inv_power)| {
+                    if let [lo, hi] = pair {
+                        *out = (*lo + *hi).halve() + (*lo - *hi) * current_beta * halve_inv_power;
+                    }
+                });
+            current_beta = current_beta.square();
+
+            core::mem::swap(&mut data, &mut next_data);
+            if let Some(stale_tail) = data.values.get_mut(next_height..) {
+                for value in stale_tail {
+                    zeroize::Zeroize::zeroize(value);
+                }
+            }
+            data.values.truncate(next_height);
+        }
+
+        Ok(data)
+    }
+}
+
 /// Whether `fold_matrix` folds a matrix of `height` rows over a base field of `field_bits`
 /// bits with `fold_matrix_packed`, given a packing of `packing_width` lanes.
 ///
@@ -523,6 +1417,1550 @@ fn lagrange_interpolate_at<F: TwoAdicField, EF: ExtensionField<F>>(
     result * l_z
 }
 
+#[cfg(feature = "secret-memory")]
+impl<Val, Dft, InputMmcs, FriMmcs, Challenge, Challenger> SecretPcsCommitter<Challenge, Challenger>
+    for TwoAdicFriPcs<Val, Dft, InputMmcs, FriMmcs>
+where
+    Val: TwoAdicField + PrimeField64 + zeroize::Zeroize,
+    Dft: TwoAdicSubgroupDft<Val> + SecretTwoAdicSubgroupDft<Val> + Sync,
+    InputMmcs: Mmcs<Val, MultiProof: Sync, Error: Sync> + SecretRecomputableMmcs<Val>,
+    InputMmcs::AuthenticationData<RowMajorMatrix<Val>>: zeroize::Zeroize,
+    FriMmcs: Mmcs<Challenge>,
+    Challenge: ExtensionField<Val>,
+    Challenger:
+        FieldChallenger<Val> + CanObserve<FriMmcs::Commitment> + GrindingChallenger<Witness = Val>,
+{
+    type SecretData = SecretTwoAdicFriData<
+        Val,
+        InputMmcs::SecretData<RowMajorMatrix<Val>>,
+        InputMmcs::AuthenticationData<RowMajorMatrix<Val>>,
+    >;
+    type SecretCommitError = SecretFriCommitError<InputMmcs::SecretError>;
+
+    fn commit_secret(
+        &self,
+        evaluations: Vec<(Self::Domain, SecretProverData<RowMajorMatrix<Val>>)>,
+    ) -> Result<(Self::Commitment, SecretProverData<Self::SecretData>), Self::SecretCommitError>
+    {
+        for (domain, matrix) in &evaluations {
+            if matrix.width == 0 || !matrix.values.len().is_multiple_of(matrix.width) {
+                return Err(SecretMatrixError::InvalidShape.into());
+            }
+            if domain.size() != matrix.height() {
+                return Err(SecretFriCommitError::DomainHeightMismatch);
+            }
+        }
+
+        let mut ldes = Vec::new();
+        ldes.try_reserve_exact(evaluations.len())
+            .map_err(|_| SecretFriCommitError::AllocationFailed)?;
+        let mut coefficients = Vec::new();
+        coefficients
+            .try_reserve_exact(evaluations.len())
+            .map_err(|_| SecretFriCommitError::AllocationFailed)?;
+        for (domain, mut matrix) in evaluations {
+            let shift = Val::GENERATOR / domain.shift();
+            let matrix_coefficients = self
+                .dft
+                .coset_lde_batch_secret_with_coefficients(&mut matrix, self.fri.log_blowup, shift)
+                .map_err(SecretFriCommitError::Dft)?;
+            reverse_matrix_index_bits(&mut matrix);
+            ldes.push(matrix);
+            coefficients.push(matrix_coefficients);
+        }
+
+        let (commitment, commitment_data) = self
+            .mmcs
+            .commit_secret(ldes)
+            .map_err(SecretFriCommitError::Mmcs)?;
+        Ok((
+            commitment,
+            SecretProverData::new(SecretTwoAdicFriData::new(
+                commitment_data,
+                coefficients,
+                self.fri.log_blowup,
+            )),
+        ))
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<Val, Dft, InputMmcs, FriMmcs, Challenge, Challenger>
+    SecretDetachedPcsCommitter<Challenge, Challenger>
+    for TwoAdicFriPcs<Val, Dft, InputMmcs, FriMmcs>
+where
+    Val: TwoAdicField + PrimeField64 + zeroize::Zeroize,
+    Dft: TwoAdicSubgroupDft<Val> + SecretTwoAdicSubgroupDft<Val> + Sync,
+    InputMmcs: Mmcs<Val, MultiProof: Sync, Error: Sync>
+        + SecretRecomputableMmcs<Val>
+        + SecretStreamingRecomputableMmcs<Val>,
+    InputMmcs::AuthenticationData<RowMajorMatrix<Val>>: zeroize::Zeroize,
+    FriMmcs: Mmcs<Challenge>,
+    Challenge: ExtensionField<Val>,
+    Challenger:
+        FieldChallenger<Val> + CanObserve<FriMmcs::Commitment> + GrindingChallenger<Witness = Val>,
+{
+    fn commit_detached_secret(
+        &self,
+        evaluations: Vec<(Self::Domain, SecretProverData<RowMajorMatrix<Val>>)>,
+    ) -> Result<(Self::Commitment, SecretProverData<Self::SecretData>), Self::SecretCommitError>
+    {
+        let blowup_shift = u32::try_from(self.fri.log_blowup)
+            .map_err(|_| SecretFriCommitError::Dft(SecretDftError::SizeOverflow))?;
+        let mut dimensions = Vec::new();
+        dimensions
+            .try_reserve_exact(evaluations.len())
+            .map_err(|_| SecretFriCommitError::AllocationFailed)?;
+        for (domain, matrix) in &evaluations {
+            if matrix.width == 0 || !matrix.values.len().is_multiple_of(matrix.width) {
+                return Err(SecretMatrixError::InvalidShape.into());
+            }
+            if domain.size() != matrix.height() {
+                return Err(SecretFriCommitError::DomainHeightMismatch);
+            }
+            let height = matrix
+                .height()
+                .checked_shl(blowup_shift)
+                .ok_or(SecretFriCommitError::Dft(SecretDftError::SizeOverflow))?;
+            dimensions.push(Dimensions {
+                width: matrix.width,
+                height,
+            });
+        }
+
+        let mut stream =
+            <InputMmcs as SecretStreamingRecomputableMmcs<Val>>::begin_streaming_commitment::<
+                RowMajorMatrix<Val>,
+            >(&self.mmcs, dimensions)
+            .map_err(SecretFriCommitError::Mmcs)?;
+        let mut coefficients = Vec::new();
+        coefficients
+            .try_reserve_exact(evaluations.len())
+            .map_err(|_| SecretFriCommitError::AllocationFailed)?;
+        for (domain, mut matrix) in evaluations {
+            let shift = Val::GENERATOR / domain.shift();
+            let matrix_coefficients = self
+                .dft
+                .coset_lde_batch_secret_with_coefficients(&mut matrix, self.fri.log_blowup, shift)
+                .map_err(SecretFriCommitError::Dft)?;
+            reverse_matrix_index_bits(&mut matrix);
+            stream.absorb(matrix).map_err(SecretFriCommitError::Mmcs)?;
+            coefficients.push(matrix_coefficients);
+        }
+
+        let detached = stream.finish().map_err(SecretFriCommitError::Mmcs)?;
+        Ok((
+            detached.commitment,
+            SecretProverData::new(SecretTwoAdicFriData::new_detached(
+                detached.prover_data,
+                detached.authentication_data,
+                coefficients,
+                self.fri.log_blowup,
+            )),
+        ))
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<Val, Dft, InputMmcs, FriMmcs, Challenge, Challenger>
+    SecretUnivariateStarkPcsCommitter<Challenge, Challenger>
+    for TwoAdicFriPcs<Val, Dft, InputMmcs, FriMmcs>
+where
+    Val: TwoAdicField + PrimeField64 + zeroize::Zeroize,
+    Dft: TwoAdicSubgroupDft<Val> + SecretTwoAdicSubgroupDft<Val> + Sync,
+    InputMmcs: Mmcs<Val, MultiProof: Sync, Error: Sync>
+        + SecretRecomputableMmcs<Val>
+        + SecretStreamingRecomputableMmcs<Val>,
+    InputMmcs::AuthenticationData<RowMajorMatrix<Val>>: zeroize::Zeroize,
+    FriMmcs: Mmcs<Challenge>,
+    Challenge: ExtensionField<Val>,
+    Challenger:
+        FieldChallenger<Val> + CanObserve<FriMmcs::Commitment> + GrindingChallenger<Witness = Val>,
+{
+    fn commit_quotient_secret(
+        &self,
+        quotient_domain: Self::Domain,
+        quotient_evaluations: SecretProverData<RowMajorMatrix<Val>>,
+        num_chunks: usize,
+    ) -> Result<(Self::Commitment, SecretProverData<Self::SecretData>), Self::SecretCommitError>
+    {
+        let mut quotients = Vec::new();
+        quotients
+            .try_reserve_exact(1)
+            .map_err(|_| SecretFriCommitError::AllocationFailed)?;
+        quotients.push(SecretQuotientCommitmentInput::new(
+            quotient_domain,
+            quotient_evaluations,
+            num_chunks,
+        ));
+        <Self as SecretUnivariateStarkPcsCommitter<Challenge, Challenger>>::commit_quotients_secret(
+            self, quotients,
+        )
+    }
+
+    fn commit_quotients_secret(
+        &self,
+        quotients: Vec<SecretQuotientCommitmentInput<Self::Domain, Val>>,
+    ) -> Result<(Self::Commitment, SecretProverData<Self::SecretData>), Self::SecretCommitError>
+    {
+        let mut plans = Vec::new();
+        plans
+            .try_reserve_exact(quotients.len())
+            .map_err(|_| SecretFriCommitError::AllocationFailed)?;
+        for quotient in &quotients {
+            let domain_size = quotient.domain().size();
+            let evaluations = quotient.evaluations();
+            let width = evaluations.width;
+            let num_chunks = quotient.num_chunks();
+            if width == 0 || !evaluations.values.len().is_multiple_of(width) {
+                return Err(SecretMatrixError::InvalidShape.into());
+            }
+            if evaluations.values.len() / width != domain_size {
+                return Err(SecretFriCommitError::DomainHeightMismatch);
+            }
+            if num_chunks == 0
+                || !num_chunks.is_power_of_two()
+                || num_chunks > domain_size
+                || !domain_size.is_multiple_of(num_chunks)
+            {
+                return Err(SecretFriCommitError::InvalidQuotientChunkCount);
+            }
+            let expected_len = domain_size
+                .checked_mul(width)
+                .ok_or(SecretMatrixError::DimensionOverflow)?;
+            if evaluations.values.len() != expected_len {
+                return Err(SecretMatrixError::InvalidShape.into());
+            }
+            plans.push(SecretQuotientCommitmentPlan::new(
+                *quotient.domain(),
+                width,
+                num_chunks,
+            ));
+        }
+
+        let mut quotients = quotients.into_iter();
+        match <Self as SecretUnivariateStarkPcsCommitter<Challenge, Challenger>>::commit_generated_quotients_secret(
+            self,
+            plans,
+            |_, _| {
+                quotients
+                    .next()
+                    .map(|quotient| quotient.into_parts().1)
+                    .ok_or(SecretFriCommitError::QuotientCountMismatch)
+            },
+        ) {
+            Ok(output) => Ok(output),
+            Err(SecretGeneratedQuotientCommitError::Generation(error))
+            | Err(SecretGeneratedQuotientCommitError::Commitment(error)) => Err(error),
+        }
+    }
+
+    fn commit_generated_quotients_secret<GenerationError>(
+        &self,
+        plans: Vec<SecretQuotientCommitmentPlan<Self::Domain>>,
+        mut generate: impl FnMut(
+            usize,
+            &SecretQuotientCommitmentPlan<Self::Domain>,
+        )
+            -> Result<SecretProverData<RowMajorMatrix<Val>>, GenerationError>,
+    ) -> SecretGeneratedQuotientCommitmentResult<
+        Self::Commitment,
+        Self::SecretData,
+        GenerationError,
+        Self::SecretCommitError,
+    >
+    where
+        GenerationError: Debug,
+    {
+        if plans.is_empty() {
+            return Err(SecretGeneratedQuotientCommitError::Commitment(
+                SecretFriCommitError::EmptyQuotientBatch,
+            ));
+        }
+
+        let mut total_chunks = 0_usize;
+        for plan in &plans {
+            let domain_size = plan.domain().size();
+            let width = plan.width();
+            let num_chunks = plan.num_chunks();
+            if width == 0 {
+                return Err(SecretGeneratedQuotientCommitError::Commitment(
+                    SecretMatrixError::InvalidShape.into(),
+                ));
+            }
+            if num_chunks == 0
+                || !num_chunks.is_power_of_two()
+                || num_chunks > domain_size
+                || !domain_size.is_multiple_of(num_chunks)
+            {
+                return Err(SecretGeneratedQuotientCommitError::Commitment(
+                    SecretFriCommitError::InvalidQuotientChunkCount,
+                ));
+            }
+            domain_size.checked_mul(width).ok_or_else(|| {
+                SecretGeneratedQuotientCommitError::Commitment(
+                    SecretMatrixError::DimensionOverflow.into(),
+                )
+            })?;
+            total_chunks = total_chunks.checked_add(num_chunks).ok_or_else(|| {
+                SecretGeneratedQuotientCommitError::Commitment(
+                    SecretMatrixError::DimensionOverflow.into(),
+                )
+            })?;
+        }
+
+        let log_blowup = u32::try_from(self.fri.log_blowup).map_err(|_| {
+            SecretGeneratedQuotientCommitError::Commitment(SecretFriCommitError::Dft(
+                SecretDftError::SizeOverflow,
+            ))
+        })?;
+        let mut lde_dimensions = Vec::new();
+        lde_dimensions
+            .try_reserve_exact(total_chunks)
+            .map_err(|_| {
+                SecretGeneratedQuotientCommitError::Commitment(
+                    SecretFriCommitError::AllocationFailed,
+                )
+            })?;
+        for plan in &plans {
+            let rows_per_chunk = plan.domain().size() / plan.num_chunks();
+            let lde_height = rows_per_chunk.checked_shl(log_blowup).ok_or_else(|| {
+                SecretGeneratedQuotientCommitError::Commitment(SecretFriCommitError::Dft(
+                    SecretDftError::SizeOverflow,
+                ))
+            })?;
+            for _ in 0..plan.num_chunks() {
+                lde_dimensions.push(Dimensions {
+                    width: plan.width(),
+                    height: lde_height,
+                });
+            }
+        }
+        let mut lde_stream =
+            <InputMmcs as SecretStreamingRecomputableMmcs<Val>>::begin_streaming_commitment::<
+                RowMajorMatrix<Val>,
+            >(&self.mmcs, lde_dimensions)
+            .map_err(|error| {
+                SecretGeneratedQuotientCommitError::Commitment(SecretFriCommitError::Mmcs(error))
+            })?;
+        let mut coefficients = Vec::new();
+        coefficients.try_reserve_exact(total_chunks).map_err(|_| {
+            SecretGeneratedQuotientCommitError::Commitment(SecretFriCommitError::AllocationFailed)
+        })?;
+
+        for (index, plan) in plans.into_iter().enumerate() {
+            let quotient_evaluations =
+                generate(index, &plan).map_err(SecretGeneratedQuotientCommitError::Generation)?;
+            let (quotient_domain, width, num_chunks) = plan.into_parts();
+            let domain_size = quotient_domain.size();
+            let expected_len = domain_size.checked_mul(width).ok_or_else(|| {
+                SecretGeneratedQuotientCommitError::Commitment(
+                    SecretMatrixError::DimensionOverflow.into(),
+                )
+            })?;
+            if quotient_evaluations.width != width
+                || quotient_evaluations.values.len() != expected_len
+            {
+                return Err(SecretGeneratedQuotientCommitError::Commitment(
+                    SecretMatrixError::InvalidShape.into(),
+                ));
+            }
+            let rows_per_chunk = domain_size / num_chunks;
+            let values_per_chunk = rows_per_chunk.checked_mul(width).ok_or_else(|| {
+                SecretGeneratedQuotientCommitError::Commitment(
+                    SecretMatrixError::DimensionOverflow.into(),
+                )
+            })?;
+            let domains = quotient_domain.split_domains(num_chunks);
+            if domains.len() != num_chunks {
+                return Err(SecretGeneratedQuotientCommitError::Commitment(
+                    SecretMatrixError::InvalidShape.into(),
+                ));
+            }
+
+            let mut chunks = Vec::new();
+            chunks.try_reserve_exact(num_chunks).map_err(|_| {
+                SecretGeneratedQuotientCommitError::Commitment(
+                    SecretFriCommitError::AllocationFailed,
+                )
+            })?;
+            for _ in 0..num_chunks {
+                let mut values = Vec::new();
+                values.try_reserve_exact(values_per_chunk).map_err(|_| {
+                    SecretGeneratedQuotientCommitError::Commitment(
+                        SecretMatrixError::AllocationFailed.into(),
+                    )
+                })?;
+                values.resize(values_per_chunk, Val::ZERO);
+                chunks.push(SecretProverData::new(RowMajorMatrix::new(values, width)));
+            }
+
+            for source_row_index in 0..domain_size {
+                let chunk_index = source_row_index % num_chunks;
+                let destination_row_index = source_row_index / num_chunks;
+                let source_start = source_row_index.checked_mul(width).ok_or_else(|| {
+                    SecretGeneratedQuotientCommitError::Commitment(
+                        SecretMatrixError::DimensionOverflow.into(),
+                    )
+                })?;
+                let source_end = source_start.checked_add(width).ok_or_else(|| {
+                    SecretGeneratedQuotientCommitError::Commitment(
+                        SecretMatrixError::DimensionOverflow.into(),
+                    )
+                })?;
+                let destination_start =
+                    destination_row_index.checked_mul(width).ok_or_else(|| {
+                        SecretGeneratedQuotientCommitError::Commitment(
+                            SecretMatrixError::DimensionOverflow.into(),
+                        )
+                    })?;
+                let destination_end = destination_start.checked_add(width).ok_or_else(|| {
+                    SecretGeneratedQuotientCommitError::Commitment(
+                        SecretMatrixError::DimensionOverflow.into(),
+                    )
+                })?;
+                let source = quotient_evaluations
+                    .values
+                    .get(source_start..source_end)
+                    .ok_or_else(|| {
+                        SecretGeneratedQuotientCommitError::Commitment(
+                            SecretMatrixError::InvalidShape.into(),
+                        )
+                    })?;
+                let destination = chunks
+                    .get_mut(chunk_index)
+                    .and_then(|chunk| chunk.values.get_mut(destination_start..destination_end))
+                    .ok_or_else(|| {
+                        SecretGeneratedQuotientCommitError::Commitment(
+                            SecretMatrixError::InvalidShape.into(),
+                        )
+                    })?;
+                destination.copy_from_slice(source);
+            }
+
+            drop(quotient_evaluations);
+
+            for (domain, mut chunk) in domains.into_iter().zip(chunks) {
+                let shift = Val::GENERATOR / domain.shift();
+                let chunk_coefficients = self
+                    .dft
+                    .coset_lde_batch_secret_with_coefficients(
+                        &mut chunk,
+                        self.fri.log_blowup,
+                        shift,
+                    )
+                    .map_err(|error| {
+                        SecretGeneratedQuotientCommitError::Commitment(SecretFriCommitError::Dft(
+                            error,
+                        ))
+                    })?;
+                reverse_matrix_index_bits(&mut chunk);
+                lde_stream.absorb(chunk).map_err(|error| {
+                    SecretGeneratedQuotientCommitError::Commitment(SecretFriCommitError::Mmcs(
+                        error,
+                    ))
+                })?;
+                coefficients.push(chunk_coefficients);
+            }
+        }
+
+        let detached = lde_stream.finish().map_err(|error| {
+            SecretGeneratedQuotientCommitError::Commitment(SecretFriCommitError::Mmcs(error))
+        })?;
+        let prover_data = SecretProverData::new(SecretTwoAdicFriData::new_detached(
+            detached.prover_data,
+            detached.authentication_data,
+            coefficients,
+            self.fri.log_blowup,
+        ));
+        Ok((detached.commitment, prover_data))
+    }
+
+    fn commit_generated_quotient_chunks_secret<GenerationError>(
+        &self,
+        plans: Vec<SecretQuotientCommitmentPlan<Self::Domain>>,
+        mut generate: impl FnMut(
+            usize,
+            &SecretQuotientCommitmentPlan<Self::Domain>,
+            usize,
+            Self::Domain,
+        )
+            -> Result<SecretProverData<RowMajorMatrix<Val>>, GenerationError>,
+    ) -> SecretGeneratedQuotientCommitmentResult<
+        Self::Commitment,
+        Self::SecretData,
+        GenerationError,
+        Self::SecretCommitError,
+    >
+    where
+        GenerationError: Debug,
+    {
+        if plans.is_empty() {
+            return Err(SecretGeneratedQuotientCommitError::Commitment(
+                SecretFriCommitError::EmptyQuotientBatch,
+            ));
+        }
+
+        let mut total_chunks = 0_usize;
+        for plan in &plans {
+            let domain_size = plan.domain().size();
+            let width = plan.width();
+            let num_chunks = plan.num_chunks();
+            if width == 0 {
+                return Err(SecretGeneratedQuotientCommitError::Commitment(
+                    SecretMatrixError::InvalidShape.into(),
+                ));
+            }
+            if num_chunks == 0
+                || !num_chunks.is_power_of_two()
+                || num_chunks > domain_size
+                || !domain_size.is_multiple_of(num_chunks)
+            {
+                return Err(SecretGeneratedQuotientCommitError::Commitment(
+                    SecretFriCommitError::InvalidQuotientChunkCount,
+                ));
+            }
+            domain_size.checked_mul(width).ok_or_else(|| {
+                SecretGeneratedQuotientCommitError::Commitment(
+                    SecretMatrixError::DimensionOverflow.into(),
+                )
+            })?;
+            total_chunks = total_chunks.checked_add(num_chunks).ok_or_else(|| {
+                SecretGeneratedQuotientCommitError::Commitment(
+                    SecretMatrixError::DimensionOverflow.into(),
+                )
+            })?;
+        }
+
+        let log_blowup = u32::try_from(self.fri.log_blowup).map_err(|_| {
+            SecretGeneratedQuotientCommitError::Commitment(SecretFriCommitError::Dft(
+                SecretDftError::SizeOverflow,
+            ))
+        })?;
+        let mut lde_dimensions = Vec::new();
+        lde_dimensions
+            .try_reserve_exact(total_chunks)
+            .map_err(|_| {
+                SecretGeneratedQuotientCommitError::Commitment(
+                    SecretFriCommitError::AllocationFailed,
+                )
+            })?;
+        for plan in &plans {
+            let rows_per_chunk = plan.domain().size() / plan.num_chunks();
+            let lde_height = rows_per_chunk.checked_shl(log_blowup).ok_or_else(|| {
+                SecretGeneratedQuotientCommitError::Commitment(SecretFriCommitError::Dft(
+                    SecretDftError::SizeOverflow,
+                ))
+            })?;
+            for _ in 0..plan.num_chunks() {
+                lde_dimensions.push(Dimensions {
+                    width: plan.width(),
+                    height: lde_height,
+                });
+            }
+        }
+        let mut lde_stream =
+            <InputMmcs as SecretStreamingRecomputableMmcs<Val>>::begin_streaming_commitment::<
+                RowMajorMatrix<Val>,
+            >(&self.mmcs, lde_dimensions)
+            .map_err(|error| {
+                SecretGeneratedQuotientCommitError::Commitment(SecretFriCommitError::Mmcs(error))
+            })?;
+        let mut coefficients = Vec::new();
+        coefficients.try_reserve_exact(total_chunks).map_err(|_| {
+            SecretGeneratedQuotientCommitError::Commitment(SecretFriCommitError::AllocationFailed)
+        })?;
+
+        for (instance_index, plan) in plans.into_iter().enumerate() {
+            let width = plan.width();
+            let num_chunks = plan.num_chunks();
+            let rows_per_chunk = plan.domain().size() / num_chunks;
+            let expected_len = rows_per_chunk.checked_mul(width).ok_or_else(|| {
+                SecretGeneratedQuotientCommitError::Commitment(
+                    SecretMatrixError::DimensionOverflow.into(),
+                )
+            })?;
+            let domains = plan.domain().split_domains(num_chunks);
+            if domains.len() != num_chunks {
+                return Err(SecretGeneratedQuotientCommitError::Commitment(
+                    SecretMatrixError::InvalidShape.into(),
+                ));
+            }
+
+            for (chunk_index, domain) in domains.into_iter().enumerate() {
+                let mut chunk = generate(instance_index, &plan, chunk_index, domain)
+                    .map_err(SecretGeneratedQuotientCommitError::Generation)?;
+                if chunk.width != width || chunk.values.len() != expected_len {
+                    return Err(SecretGeneratedQuotientCommitError::Commitment(
+                        SecretMatrixError::InvalidShape.into(),
+                    ));
+                }
+                let shift = Val::GENERATOR / domain.shift();
+                let chunk_coefficients = self
+                    .dft
+                    .coset_lde_batch_secret_with_coefficients(
+                        &mut chunk,
+                        self.fri.log_blowup,
+                        shift,
+                    )
+                    .map_err(|error| {
+                        SecretGeneratedQuotientCommitError::Commitment(SecretFriCommitError::Dft(
+                            error,
+                        ))
+                    })?;
+                reverse_matrix_index_bits(&mut chunk);
+                lde_stream.absorb(chunk).map_err(|error| {
+                    SecretGeneratedQuotientCommitError::Commitment(SecretFriCommitError::Mmcs(
+                        error,
+                    ))
+                })?;
+                coefficients.push(chunk_coefficients);
+            }
+        }
+
+        let detached = lde_stream.finish().map_err(|error| {
+            SecretGeneratedQuotientCommitError::Commitment(SecretFriCommitError::Mmcs(error))
+        })?;
+        let prover_data = SecretProverData::new(SecretTwoAdicFriData::new_detached(
+            detached.prover_data,
+            detached.authentication_data,
+            coefficients,
+            self.fri.log_blowup,
+        ));
+        Ok((detached.commitment, prover_data))
+    }
+}
+
+struct PreparedPcsOpening<'a, Challenger, Val: PrimeField64, Challenge, ReducedOpening> {
+    all_opened_values: OpenedValues<Challenge>,
+    fri_input: Vec<ReducedOpening>,
+    log_global_max_height: usize,
+    batch_pow_witness: Val,
+    transcript: PcsProverTranscript<'a, Challenger, Val, Challenge>,
+}
+
+struct PreparedPcsClaims<'a, Challenger, Val: PrimeField64, Challenge> {
+    all_opened_values: OpenedValues<Challenge>,
+    inverse_denominators: LinearMap<Challenge, Vec<Challenge>>,
+    global_max_width: usize,
+    log_global_max_height: usize,
+    alpha: Challenge,
+    batch_pow_witness: Val,
+    transcript: PcsProverTranscript<'a, Challenger, Val, Challenge>,
+}
+
+trait ReducedOpeningBuffer<F> {
+    fn len(&self) -> usize;
+    fn values_mut(&mut self) -> &mut [F];
+}
+
+impl<F> ReducedOpeningBuffer<F> for Vec<F> {
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    fn values_mut(&mut self) -> &mut [F] {
+        self.as_mut_slice()
+    }
+}
+
+struct OpeningReductionState<'a, Val, Challenge, ReducedOpening, PreparationError, MakeReduced>
+where
+    Val: PrimeField64 + TwoAdicField,
+    Challenge: ExtensionField<Val>,
+{
+    alpha: Challenge,
+    inverse_denominators: &'a LinearMap<Challenge, Vec<Challenge>>,
+    packed_alpha_powers: Vec<Challenge::ExtensionPacking>,
+    num_reduced: Vec<usize>,
+    reduced_openings: Vec<Option<ReducedOpening>>,
+    make_reduced: MakeReduced,
+    _error: PhantomData<PreparationError>,
+}
+
+impl<'a, Val, Challenge, ReducedOpening, PreparationError, MakeReduced>
+    OpeningReductionState<'a, Val, Challenge, ReducedOpening, PreparationError, MakeReduced>
+where
+    Val: PrimeField64 + TwoAdicField,
+    Challenge: ExtensionField<Val>,
+    ReducedOpening: ReducedOpeningBuffer<Challenge>,
+    PreparationError: From<FriProverError>,
+    MakeReduced: FnMut(usize) -> Result<ReducedOpening, PreparationError>,
+{
+    fn new(
+        alpha: Challenge,
+        global_max_width: usize,
+        inverse_denominators: &'a LinearMap<Challenge, Vec<Challenge>>,
+        make_reduced: MakeReduced,
+    ) -> Result<Self, PreparationError> {
+        let height_bucket_count = Val::TWO_ADICITY
+            .checked_add(1)
+            .ok_or(FriProverError::OpeningHeightUnsupported)?;
+        let packed_alpha_powers =
+            Challenge::ExtensionPacking::packed_ext_powers_capped(alpha, global_max_width)
+                .collect_vec();
+        Ok(Self {
+            alpha,
+            inverse_denominators,
+            packed_alpha_powers,
+            num_reduced: alloc::vec![0_usize; height_bucket_count],
+            reduced_openings: core::iter::repeat_with(|| None)
+                .take(height_bucket_count)
+                .collect_vec(),
+            make_reduced,
+            _error: PhantomData,
+        })
+    }
+
+    fn reduce_matrix(
+        &mut self,
+        matrix: RowMajorMatrixView<'_, Val>,
+        points: &[Challenge],
+        openings: &[Vec<Challenge>],
+    ) -> Result<(), PreparationError> {
+        if points.len() != openings.len() {
+            return Err(FriProverError::OpeningRequestShapeMismatch.into());
+        }
+        let _guard = debug_span!("reduce matrix quotient", dims = %matrix.dimensions()).entered();
+        let log_height = log2_strict_usize(matrix.height());
+        let reduced_opening_slot = self
+            .reduced_openings
+            .get_mut(log_height)
+            .ok_or(FriProverError::OpeningHeightUnsupported)?;
+        if reduced_opening_slot.is_none() {
+            *reduced_opening_slot = Some((self.make_reduced)(matrix.height())?);
+        }
+        let reduced_opening_for_log_height = reduced_opening_slot
+            .as_mut()
+            .ok_or(FriProverError::OpeningRequestShapeMismatch)?;
+        if reduced_opening_for_log_height.len() != matrix.height() {
+            return Err(FriProverError::OpeningRequestShapeMismatch.into());
+        }
+        let num_reduced_at_height = self
+            .num_reduced
+            .get_mut(log_height)
+            .ok_or(FriProverError::OpeningHeightUnsupported)?;
+
+        let first_alpha_exponent = u64::try_from(*num_reduced_at_height)
+            .map_err(|_| FriProverError::OpeningBatchWidthOverflow)?;
+        let first_alpha_pow_offset = self.alpha.exp_u64(first_alpha_exponent);
+        let packed_width = matrix.width().div_ceil(Val::Packing::WIDTH);
+        let offset_alpha_powers = self
+            .packed_alpha_powers
+            .get(..packed_width)
+            .ok_or(FriProverError::OpeningRequestShapeMismatch)?
+            .iter()
+            .map(|&power| power * first_alpha_pow_offset)
+            .collect_vec();
+
+        let mut point_reductions = Vec::with_capacity(points.len());
+        for (point_index, (&point, opened_values)) in points.iter().zip(openings).enumerate() {
+            let alpha_exponent = u64::try_from(*num_reduced_at_height)
+                .map_err(|_| FriProverError::OpeningBatchWidthOverflow)?;
+            let alpha_pow_offset = self.alpha.exp_u64(alpha_exponent);
+            let reduced_opening: Challenge =
+                dot_product(self.alpha.powers(), opened_values.iter().copied());
+            let weighted_opening = alpha_pow_offset * reduced_opening;
+            let point_offset = point_index
+                .checked_mul(matrix.width())
+                .ok_or(FriProverError::OpeningBatchWidthOverflow)?;
+            let point_exponent = u64::try_from(point_offset)
+                .map_err(|_| FriProverError::OpeningBatchWidthOverflow)?;
+            let rescale = self.alpha.exp_u64(point_exponent);
+            let denominators = self
+                .inverse_denominators
+                .get(&point)
+                .ok_or(FriProverError::OpeningDenominatorTableMismatch)?;
+            if denominators.len() < matrix.height() {
+                return Err(FriProverError::OpeningDenominatorTableMismatch.into());
+            }
+            *num_reduced_at_height = num_reduced_at_height
+                .checked_add(matrix.width())
+                .ok_or(FriProverError::OpeningBatchWidthOverflow)?;
+            point_reductions.push((weighted_opening, rescale, denominators.as_slice()));
+        }
+
+        debug_span!("compress and reduce mat").in_scope(|| {
+            matrix
+                .rowwise_packed_dot_product::<Challenge>(&offset_alpha_powers)
+                .zip(reduced_opening_for_log_height.values_mut().par_iter_mut())
+                .enumerate()
+                .for_each(|(row_index, (reduced_row, reduced_opening))| {
+                    let Some((first, remaining)) = point_reductions.split_first() else {
+                        return;
+                    };
+                    let first_denominator =
+                        first.2.get(row_index).copied().unwrap_or(Challenge::ZERO);
+                    *reduced_opening += (first.0 - reduced_row) * first_denominator;
+
+                    for &(weighted_opening, rescale, denominators) in remaining {
+                        let denominator = denominators
+                            .get(row_index)
+                            .copied()
+                            .unwrap_or(Challenge::ZERO);
+                        *reduced_opening +=
+                            (weighted_opening - rescale * reduced_row) * denominator;
+                    }
+                });
+        });
+        Ok(())
+    }
+
+    fn finish(self) -> Vec<ReducedOpening> {
+        self.reduced_openings
+            .into_iter()
+            .rev()
+            .flatten()
+            .collect_vec()
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<F> ReducedOpeningBuffer<F> for SecretProverData<RowMajorMatrix<F>>
+where
+    F: zeroize::Zeroize,
+{
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    fn values_mut(&mut self) -> &mut [F] {
+        self.values.as_mut_slice()
+    }
+}
+
+type OpeningMatricesAndPoints<'a, Val, Challenge> =
+    (Vec<RowMajorMatrixView<'a, Val>>, &'a [Vec<Challenge>]);
+
+type OpeningDimensionsAndPoints<'a, Challenge> = (Vec<Dimensions>, &'a [Vec<Challenge>]);
+
+struct OpeningClaimGeometry<Challenge> {
+    inverse_denominators: LinearMap<Challenge, Vec<Challenge>>,
+    adjusted_weights: LinearMap<Challenge, Vec<Challenge>>,
+    global_max_width: usize,
+    log_global_max_height: usize,
+}
+
+impl<Val, Dft, InputMmcs, FriMmcs> TwoAdicFriPcs<Val, Dft, InputMmcs, FriMmcs> {
+    fn prepare_opening_geometry<Challenge>(
+        &self,
+        dimensions_and_points: &[OpeningDimensionsAndPoints<'_, Challenge>],
+    ) -> Result<OpeningClaimGeometry<Challenge>, FriProverError>
+    where
+        Val: TwoAdicField + PrimeField64,
+        Challenge: ExtensionField<Val>,
+    {
+        for (batch, (dimensions, points)) in dimensions_and_points.iter().enumerate() {
+            if dimensions.len() != points.len() {
+                return Err(FriProverError::OpeningRequestShapeMismatch);
+            }
+            for (matrix, (matrix_dimensions, points_for_matrix)) in
+                dimensions.iter().zip(*points).enumerate()
+            {
+                if matrix_dimensions.height == 0
+                    || !matrix_dimensions.height.is_power_of_two()
+                    || matrix_dimensions.width == 0
+                {
+                    return Err(FriProverError::OpeningRequestShapeMismatch);
+                }
+                self.fri
+                    .validate_input_height(log2_strict_usize(matrix_dimensions.height))?;
+                // The verifier cannot bind a matrix width when that matrix has
+                // no claim. Reject this before transcript state or guarded
+                // prover data can be consumed.
+                if points_for_matrix.is_empty() {
+                    return Err(FriProverError::MatrixWithoutOpeningPoints { batch, matrix });
+                }
+                if points_for_matrix.iter().any(Field::is_zero) {
+                    return Err(FriProverError::OpeningPointUnsupported);
+                }
+            }
+        }
+
+        let (global_max_height, global_max_width) = dimensions_and_points
+            .iter()
+            .flat_map(|(dimensions, _)| {
+                dimensions
+                    .iter()
+                    .map(|dimensions| (dimensions.height, dimensions.width))
+            })
+            .reduce(|(height_max, width_max), (height, width)| {
+                (height_max.max(height), width_max.max(width))
+            })
+            .ok_or(FriProverError::EmptyOpeningBatch)?;
+        let log_global_max_height = log2_strict_usize(global_max_height);
+        let coset = {
+            let domain = TwoAdicMultiplicativeCoset::new(Val::GENERATOR, log_global_max_height)
+                .ok_or(FriProverError::OpeningDomainUnavailable)?;
+            let mut points = Vec::new();
+            points
+                .try_reserve_exact(global_max_height)
+                .map_err(|_| FriProverError::AllocationFailed)?;
+            points.extend(domain.iter());
+            reverse_slice_index_bits(&mut points);
+            points
+        };
+        let inverse_denominators =
+            compute_inverse_denominators_for_dimensions(dimensions_and_points, &coset);
+        drop(coset);
+
+        let mut adjusted_weights = LinearMap::new();
+        for (point, denominators) in &inverse_denominators {
+            let prefix_len = denominators.len() >> self.fri.log_blowup;
+            let prefix = denominators
+                .get(..prefix_len)
+                .ok_or(FriProverError::OpeningWeightTableMismatch)?;
+            adjusted_weights.insert(*point, compute_adjusted_weights(*point, prefix));
+        }
+
+        Ok(OpeningClaimGeometry {
+            inverse_denominators,
+            adjusted_weights,
+            global_max_width,
+            log_global_max_height,
+        })
+    }
+
+    /// Interpolate claims and reduce every quotient into owned FRI codewords.
+    ///
+    /// The returned state deliberately contains no view into the committed matrices. This is the
+    /// ownership boundary required by secret-memory proving: a guarded caller can release or detach
+    /// the commitment data before FRI selects and authenticates query rows.
+    fn prepare_opening<'challenger, Challenge, Challenger>(
+        &self,
+        mats_and_points: &[OpeningMatricesAndPoints<'_, Val, Challenge>],
+        challenger: &'challenger mut Challenger,
+    ) -> Result<
+        PreparedPcsOpening<'challenger, Challenger, Val, Challenge, Vec<Challenge>>,
+        FriProverError,
+    >
+    where
+        Val: TwoAdicField + PrimeField64,
+        Challenge: ExtensionField<Val>,
+        FriMmcs: Mmcs<Challenge>,
+        Challenger: FieldChallenger<Val>
+            + CanObserve<FriMmcs::Commitment>
+            + GrindingChallenger<Witness = Val>,
+    {
+        self.prepare_opening_with_reduced_buffer(
+            mats_and_points,
+            challenger,
+            |height| Ok(Challenge::zero_vec(height)),
+            |low_coset, point, adjusted| {
+                Ok(
+                    low_coset.interpolate_coset_with_precomputation(
+                        Val::GENERATOR,
+                        point,
+                        adjusted,
+                    ),
+                )
+            },
+        )
+    }
+
+    fn prepare_opening_claims_with_interpolator<
+        'challenger,
+        Challenge,
+        Challenger,
+        PreparationError,
+        InterpolateOpening,
+    >(
+        &self,
+        mats_and_points: &[OpeningMatricesAndPoints<'_, Val, Challenge>],
+        challenger: &'challenger mut Challenger,
+        mut interpolate_opening: InterpolateOpening,
+    ) -> Result<PreparedPcsClaims<'challenger, Challenger, Val, Challenge>, PreparationError>
+    where
+        Val: TwoAdicField + PrimeField64,
+        Challenge: ExtensionField<Val>,
+        FriMmcs: Mmcs<Challenge>,
+        Challenger: FieldChallenger<Val>
+            + CanObserve<FriMmcs::Commitment>
+            + GrindingChallenger<Witness = Val>,
+        PreparationError: From<FriProverError>,
+        InterpolateOpening: for<'matrix> FnMut(
+            RowMajorMatrixView<'matrix, Val>,
+            Challenge,
+            &[Challenge],
+        ) -> Result<Vec<Challenge>, PreparationError>,
+    {
+        let mut dimensions_and_points = Vec::new();
+        dimensions_and_points
+            .try_reserve_exact(mats_and_points.len())
+            .map_err(|_| FriProverError::AllocationFailed)?;
+        for (matrices, points) in mats_and_points {
+            let mut dimensions = Vec::new();
+            dimensions
+                .try_reserve_exact(matrices.len())
+                .map_err(|_| FriProverError::AllocationFailed)?;
+            dimensions.extend(matrices.iter().map(|matrix| matrix.dimensions()));
+            dimensions_and_points.push((dimensions, *points));
+        }
+        let OpeningClaimGeometry {
+            inverse_denominators,
+            adjusted_weights,
+            global_max_width,
+            log_global_max_height,
+        } = self.prepare_opening_geometry(&dimensions_and_points)?;
+        drop(dimensions_and_points);
+
+        let mut all_opened_values = Vec::new();
+        all_opened_values
+            .try_reserve_exact(mats_and_points.len())
+            .map_err(|_| FriProverError::AllocationFailed)?;
+        for (matrices, points) in mats_and_points {
+            let mut openings_for_round = Vec::new();
+            openings_for_round
+                .try_reserve_exact(matrices.len())
+                .map_err(|_| FriProverError::AllocationFailed)?;
+            for (matrix, points_for_matrix) in izip!(matrices, *points) {
+                let interpolation_height = matrix.height() >> self.fri.log_blowup;
+                let (low_coset, _) = matrix.split_rows(interpolation_height);
+                let mut openings_for_matrix = Vec::new();
+                openings_for_matrix
+                    .try_reserve_exact(points_for_matrix.len())
+                    .map_err(|_| FriProverError::AllocationFailed)?;
+                for &point in points_for_matrix {
+                    let _guard =
+                        debug_span!("evaluate matrix", dims = %matrix.dimensions()).entered();
+                    let weights = adjusted_weights
+                        .get(&point)
+                        .ok_or(FriProverError::OpeningWeightTableMismatch)?;
+                    let adjusted = weights
+                        .get(..interpolation_height)
+                        .ok_or(FriProverError::OpeningWeightTableMismatch)?;
+                    let opening = debug_span!("compute opened values with Lagrange interpolation")
+                        .in_scope(|| interpolate_opening(low_coset, point, adjusted))?;
+                    openings_for_matrix.push(opening);
+                }
+                openings_for_round.push(openings_for_matrix);
+            }
+            all_opened_values.push(openings_for_round);
+        }
+        drop(adjusted_weights);
+
+        let mut transcript = PcsProverTranscript::<Challenger, Val, Challenge>::new(
+            challenger,
+            PcsShape::from_opened_values(&self.fri, &all_opened_values),
+        );
+        transcript.claimed_openings(&all_opened_values);
+        let (alpha, batch_pow_witness) = transcript.batch_phase();
+
+        Ok(PreparedPcsClaims {
+            all_opened_values,
+            inverse_denominators,
+            global_max_width,
+            log_global_max_height,
+            alpha,
+            batch_pow_witness: batch_pow_witness.unwrap_or(Val::ZERO),
+            transcript,
+        })
+    }
+
+    /// Shared opening reduction whose storage policy is selected by the caller.
+    ///
+    /// The ordinary path supplies `Vec`; guarded proving supplies a matrix that
+    /// is already under a zeroizing owner before quotient values are written.
+    fn prepare_opening_with_reduced_buffer<
+        'challenger,
+        Challenge,
+        Challenger,
+        ReducedOpening,
+        PreparationError,
+        MakeReduced,
+        InterpolateOpening,
+    >(
+        &self,
+        mats_and_points: &[OpeningMatricesAndPoints<'_, Val, Challenge>],
+        challenger: &'challenger mut Challenger,
+        make_reduced: MakeReduced,
+        interpolate_opening: InterpolateOpening,
+    ) -> Result<
+        PreparedPcsOpening<'challenger, Challenger, Val, Challenge, ReducedOpening>,
+        PreparationError,
+    >
+    where
+        Val: TwoAdicField + PrimeField64,
+        Challenge: ExtensionField<Val>,
+        FriMmcs: Mmcs<Challenge>,
+        Challenger: FieldChallenger<Val>
+            + CanObserve<FriMmcs::Commitment>
+            + GrindingChallenger<Witness = Val>,
+        ReducedOpening: ReducedOpeningBuffer<Challenge>,
+        PreparationError: From<FriProverError>,
+        MakeReduced: FnMut(usize) -> Result<ReducedOpening, PreparationError>,
+        InterpolateOpening: for<'matrix> FnMut(
+            RowMajorMatrixView<'matrix, Val>,
+            Challenge,
+            &[Challenge],
+        ) -> Result<Vec<Challenge>, PreparationError>,
+    {
+        let PreparedPcsClaims {
+            all_opened_values,
+            inverse_denominators,
+            global_max_width,
+            log_global_max_height,
+            alpha,
+            batch_pow_witness,
+            mut transcript,
+        } = self.prepare_opening_claims_with_interpolator(
+            mats_and_points,
+            challenger,
+            interpolate_opening,
+        )?;
+
+        // Now that we have sent the openings to the verifier, it remains to prove
+        // that those openings are correct.
+
+        // Given a low degree polynomial `f(x)` with claimed evaluation `f(zeta)`, we can check
+        // that `f(zeta)` is correct by doing a low degree test on `(f(zeta) - f(x))/(zeta - x)`.
+        // We will use `alpha` to batch together both different claimed openings `zeta` and
+        // different polynomials `f` whose evaluation vectors have the same height.
+
+        // TODO: If we allow different polynomials to have different blow_up factors
+        // we may need to revisit this and to ensure it is safe to batch them together.
+
+        // Every operation below is fallible while the PCS transcript is live.
+        // Keep it in one result boundary so an error can release the transcript
+        // completeness check before guarded reduced-opening owners unwind.
+        let reduction_result = (|| -> Result<Vec<ReducedOpening>, PreparationError> {
+            let mut reduction = OpeningReductionState::new(
+                alpha,
+                global_max_width,
+                &inverse_denominators,
+                make_reduced,
+            )?;
+
+            for ((mats, points), openings_for_round) in
+                mats_and_points.iter().zip(all_opened_values.iter())
+            {
+                for (mat, points_for_mat, openings_for_mat) in
+                    izip!(mats.iter(), points.iter(), openings_for_round.iter())
+                {
+                    reduction.reduce_matrix(*mat, points_for_mat, openings_for_mat)?;
+                }
+            }
+
+            Ok(reduction.finish())
+        })();
+        let fri_input = match reduction_result {
+            Ok(fri_input) => fri_input,
+            Err(error) => {
+                transcript.abort();
+                return Err(error);
+            }
+        };
+
+        Ok(PreparedPcsOpening {
+            all_opened_values,
+            fri_input,
+            log_global_max_height,
+            batch_pow_witness,
+            transcript,
+        })
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<Val, Dft, InputMmcs, FriMmcs> TwoAdicFriPcs<Val, Dft, InputMmcs, FriMmcs>
+where
+    Val: TwoAdicField + PrimeField64 + zeroize::Zeroize,
+    Dft: TwoAdicSubgroupDft<Val> + SecretTwoAdicSubgroupDft<Val> + Sync,
+    InputMmcs: Mmcs<Val, MultiProof: Sync, Error: Sync> + SecretRecomputableMmcs<Val>,
+    InputMmcs::AuthenticationData<RowMajorMatrix<Val>>: zeroize::Zeroize,
+{
+    /// Construct a complete PCS opening proof without releasing a
+    /// secret-derived codeword from zeroizing ownership.
+    ///
+    /// Opening geometry is validated from public dimensions first. The prover
+    /// then detaches full private value leaves before evaluating disclosed
+    /// claims directly from compact coefficients. Quotient reduction
+    /// reconstructs one private matrix under a temporary zeroizing owner and
+    /// erases it before reconstructing the next. The FRI driver later fixes
+    /// its query indices before selected rows are authenticated.
+    fn open_secret_mixed_guarded_inner<Challenge, Challenger>(
+        &self,
+        mut requests: SecretTwoAdicPcsMixedOpeningRequests<'_, Val, InputMmcs, Challenge>,
+        challenger: &mut Challenger,
+    ) -> SecretTwoAdicOpeningResult<
+        Challenge,
+        FriMmcs,
+        Val,
+        InputMmcs,
+        InputMmcs::SecretError,
+        FriMmcs::SecretError,
+    >
+    where
+        Challenge: ExtensionField<Val> + zeroize::Zeroize,
+        FriMmcs: Mmcs<Challenge> + SecretMmcs<Challenge>,
+        Challenger: FieldChallenger<Val>
+            + CanObserve<FriMmcs::Commitment>
+            + GrindingChallenger<Witness = Val>,
+    {
+        let mut dimensions_and_points = Vec::new();
+        dimensions_and_points
+            .try_reserve_exact(requests.len())
+            .map_err(|_| SecretFriOpenError::AllocationFailed)?;
+        for request in &requests {
+            let (dimensions, points) = match request {
+                SecretPcsMixedOpeningRequest::Public(request) => {
+                    let matrices = self.mmcs.get_matrices(request.prover_data);
+                    let mut dimensions = Vec::new();
+                    dimensions
+                        .try_reserve_exact(matrices.len())
+                        .map_err(|_| SecretFriOpenError::AllocationFailed)?;
+                    dimensions.extend(matrices.iter().map(|matrix| matrix.dimensions()));
+                    (dimensions, request.points.as_slice())
+                }
+                SecretPcsMixedOpeningRequest::Private(request) => {
+                    if request.prover_data.log_blowup != self.fri.log_blowup {
+                        return Err(FriProverError::OpeningRequestShapeMismatch.into());
+                    }
+                    let dimensions = request.prover_data.retained_lde_dimensions()?;
+                    (dimensions, request.points.as_slice())
+                }
+            };
+            dimensions_and_points.push((dimensions, points));
+        }
+
+        let OpeningClaimGeometry {
+            inverse_denominators,
+            adjusted_weights,
+            global_max_width,
+            log_global_max_height,
+        } = self.prepare_opening_geometry(&dimensions_and_points)?;
+        drop(dimensions_and_points);
+
+        // Geometry and every opening request have been validated without
+        // touching prover state. Compact coefficients plus authentication
+        // nodes are now sufficient, so erase full private leaves before any
+        // witness-derived claim interpolation or FRI reduction allocation.
+        for request in &mut requests {
+            if let SecretPcsMixedOpeningRequest::Private(request) = request
+                && request.prover_data.authentication_data.is_none()
+            {
+                self.detach_commitment_data_secret(&mut *request.prover_data)
+                    .map_err(SecretFriOpenError::InputDetachment)?;
+            }
+        }
+
+        let mut all_opened_values = Vec::new();
+        all_opened_values
+            .try_reserve_exact(requests.len())
+            .map_err(|_| SecretFriOpenError::AllocationFailed)?;
+        for request in &requests {
+            let matrix_count = match request {
+                SecretPcsMixedOpeningRequest::Public(request) => request.points.len(),
+                SecretPcsMixedOpeningRequest::Private(request) => request.points.len(),
+            };
+            let mut openings_for_round = Vec::new();
+            openings_for_round
+                .try_reserve_exact(matrix_count)
+                .map_err(|_| SecretFriOpenError::AllocationFailed)?;
+
+            match request {
+                SecretPcsMixedOpeningRequest::Public(request) => {
+                    let matrices = self.mmcs.get_matrices(request.prover_data);
+                    if matrices.len() != request.points.len() {
+                        return Err(FriProverError::OpeningRequestShapeMismatch.into());
+                    }
+                    for (matrix, points_for_matrix) in izip!(matrices, &request.points) {
+                        let interpolation_height = matrix.height() >> self.fri.log_blowup;
+                        let (low_coset, _) = matrix.split_rows(interpolation_height);
+                        let mut openings_for_matrix = Vec::new();
+                        openings_for_matrix
+                            .try_reserve_exact(points_for_matrix.len())
+                            .map_err(|_| SecretFriOpenError::AllocationFailed)?;
+                        for &point in points_for_matrix {
+                            let weights = adjusted_weights
+                                .get(&point)
+                                .ok_or(FriProverError::OpeningWeightTableMismatch)?;
+                            let adjusted = weights
+                                .get(..interpolation_height)
+                                .ok_or(FriProverError::OpeningWeightTableMismatch)?;
+                            let opening = low_coset
+                                .interpolate_coset_with_precomputation_secret(
+                                    Val::GENERATOR,
+                                    point,
+                                    adjusted,
+                                )
+                                .map_err(SecretFriOpenError::Matrix)?;
+                            openings_for_matrix.push(opening);
+                        }
+                        openings_for_round.push(openings_for_matrix);
+                    }
+                }
+                SecretPcsMixedOpeningRequest::Private(request) => {
+                    if request.prover_data.coefficients.len() != request.points.len() {
+                        return Err(FriProverError::OpeningRequestShapeMismatch.into());
+                    }
+                    for (coefficients, points_for_matrix) in
+                        request.prover_data.coefficients.iter().zip(&request.points)
+                    {
+                        let mut openings_for_matrix = Vec::new();
+                        openings_for_matrix
+                            .try_reserve_exact(points_for_matrix.len())
+                            .map_err(|_| SecretFriOpenError::AllocationFailed)?;
+                        for &point in points_for_matrix {
+                            openings_for_matrix.push(
+                                Self::evaluate_coefficients_at_point_secret(coefficients, point)
+                                    .map_err(SecretFriOpenError::Matrix)?,
+                            );
+                        }
+                        openings_for_round.push(openings_for_matrix);
+                    }
+                }
+            }
+            all_opened_values.push(openings_for_round);
+        }
+        drop(adjusted_weights);
+
+        let mut transcript = PcsProverTranscript::<Challenger, Val, Challenge>::new(
+            challenger,
+            PcsShape::from_opened_values(&self.fri, &all_opened_values),
+        );
+        transcript.claimed_openings(&all_opened_values);
+        let (alpha, batch_pow_witness) = transcript.batch_phase();
+        let batch_pow_witness = batch_pow_witness.unwrap_or(Val::ZERO);
+
+        let reduction_result = (|| {
+            let mut reduction = OpeningReductionState::new(
+                alpha,
+                global_max_width,
+                &inverse_denominators,
+                |height| {
+                    let mut values = Vec::new();
+                    values
+                        .try_reserve_exact(height)
+                        .map_err(|_| SecretMatrixError::AllocationFailed)?;
+                    values.resize(height, Challenge::ZERO);
+                    Ok::<_, SecretFriOpenError<InputMmcs::SecretError, FriMmcs::SecretError>>(
+                        SecretProverData::new(RowMajorMatrix::new(values, 1)),
+                    )
+                },
+            )?;
+
+            for (round_index, request) in requests.iter().enumerate() {
+                let openings_for_round = all_opened_values
+                    .get(round_index)
+                    .ok_or(FriProverError::OpeningRequestShapeMismatch)?;
+                match request {
+                    SecretPcsMixedOpeningRequest::Public(request) => {
+                        let matrices = self.mmcs.get_matrices(request.prover_data);
+                        if matrices.len() != request.points.len()
+                            || matrices.len() != openings_for_round.len()
+                        {
+                            return Err(FriProverError::OpeningRequestShapeMismatch.into());
+                        }
+                        for (matrix, points, openings) in
+                            izip!(matrices, &request.points, openings_for_round)
+                        {
+                            reduction.reduce_matrix(matrix.as_view(), points, openings)?;
+                        }
+                    }
+                    SecretPcsMixedOpeningRequest::Private(request) => {
+                        if request.points.len() != openings_for_round.len() {
+                            return Err(FriProverError::OpeningRequestShapeMismatch.into());
+                        }
+                        for (matrix_index, (points, openings)) in
+                            request.points.iter().zip(openings_for_round).enumerate()
+                        {
+                            let matrix = self
+                                .recompute_lde_matrix_secret(&*request.prover_data, matrix_index)?;
+                            reduction.reduce_matrix(matrix.as_view(), points, openings)?;
+                        }
+                    }
+                }
+            }
+            Ok::<_, SecretFriOpenError<InputMmcs::SecretError, FriMmcs::SecretError>>(
+                reduction.finish(),
+            )
+        })();
+        let fri_input = match reduction_result {
+            Ok(fri_input) => fri_input,
+            Err(error) => {
+                transcript.abort();
+                return Err(error);
+            }
+        };
+
+        let folding: TwoAdicFriFoldingForMmcs<Val, InputMmcs> = TwoAdicFriFolding(PhantomData);
+        let fri_result = transcript.delegate(|challenger| {
+            prover::prove_fri_secret_with_input_opener(
+                &folding,
+                &self.fri,
+                fri_input,
+                challenger,
+                log_global_max_height,
+                batch_pow_witness,
+                |indices| {
+                    let mut input_openings = Vec::new();
+                    input_openings
+                        .try_reserve_exact(requests.len())
+                        .map_err(|_| SecretFriCommitError::AllocationFailed)?;
+
+                    for request in &mut requests {
+                        let opening = match request {
+                            SecretPcsMixedOpeningRequest::Public(request) => {
+                                let local_max_height = self
+                                    .mmcs
+                                    .get_matrices(request.prover_data)
+                                    .iter()
+                                    .map(|matrix| matrix.height())
+                                    .max()
+                                    .ok_or(SecretFriCommitError::EmptyRetainedCoefficients)?;
+                                let local_log_height = log2_strict_usize(local_max_height);
+                                let bits_reduced = log_global_max_height
+                                    .checked_sub(local_log_height)
+                                    .ok_or(SecretMatrixError::InvalidShape)?;
+                                let mut reduced_indices = Vec::new();
+                                reduced_indices
+                                    .try_reserve_exact(indices.len())
+                                    .map_err(|_| SecretFriCommitError::AllocationFailed)?;
+                                reduced_indices
+                                    .extend(indices.iter().map(|&index| index >> bits_reduced));
+                                let (opened_values, opening_proof) = self
+                                    .mmcs
+                                    .open_multi_batch(&reduced_indices, request.prover_data);
+                                BatchMultiOpening {
+                                    opened_values,
+                                    opening_proof,
+                                }
+                            }
+                            SecretPcsMixedOpeningRequest::Private(request) => {
+                                let local_max_height = request
+                                    .prover_data
+                                    .max_lde_height()
+                                    .map_err(SecretFriCommitError::Matrix)?;
+                                let local_log_height = log2_strict_usize(local_max_height);
+                                let bits_reduced = log_global_max_height
+                                    .checked_sub(local_log_height)
+                                    .ok_or(SecretMatrixError::InvalidShape)?;
+                                let mut reduced_indices = Vec::new();
+                                reduced_indices
+                                    .try_reserve_exact(indices.len())
+                                    .map_err(|_| SecretFriCommitError::AllocationFailed)?;
+                                reduced_indices
+                                    .extend(indices.iter().map(|&index| index >> bits_reduced));
+                                let opening = self.detach_and_open_multi_batch_secret(
+                                    &reduced_indices,
+                                    &mut *request.prover_data,
+                                )?;
+                                // Selected rows and their authentication proof are now
+                                // public proof material. No later phase needs the compact
+                                // coefficients, so erase them before retaining the output.
+                                zeroize::Zeroize::zeroize(&mut request.prover_data.coefficients);
+                                opening
+                            }
+                        };
+                        input_openings.push(opening);
+                    }
+
+                    Ok(input_openings)
+                },
+            )
+        });
+
+        let fri_proof = match fri_result {
+            Ok(proof) => proof,
+            Err(error) => {
+                transcript.abort();
+                return Err(SecretFriOpenError::Fri(error));
+            }
+        };
+        transcript
+            .finish_secret()
+            .map_err(SecretFriOpenError::Transcript)?;
+
+        Ok((all_opened_values, fri_proof))
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<Val, Dft, InputMmcs, FriMmcs, Challenge, Challenger> SecretPcsOpener<Challenge, Challenger>
+    for TwoAdicFriPcs<Val, Dft, InputMmcs, FriMmcs>
+where
+    Val: TwoAdicField + PrimeField64 + zeroize::Zeroize,
+    Dft: TwoAdicSubgroupDft<Val> + SecretTwoAdicSubgroupDft<Val> + Sync,
+    InputMmcs: Mmcs<Val, MultiProof: Sync, Error: Sync> + SecretRecomputableMmcs<Val>,
+    InputMmcs::AuthenticationData<RowMajorMatrix<Val>>: zeroize::Zeroize,
+    FriMmcs: Mmcs<Challenge> + SecretMmcs<Challenge>,
+    Challenge: ExtensionField<Val> + zeroize::Zeroize,
+    Challenger:
+        FieldChallenger<Val> + CanObserve<FriMmcs::Commitment> + GrindingChallenger<Witness = Val>,
+{
+    type SecretOpenError = SecretTwoAdicPcsOpenError;
+
+    fn open_secret(
+        &self,
+        requests: Vec<SecretOpeningRequest<'_, Self::SecretData, Challenge>>,
+        challenger: &mut Challenger,
+    ) -> Result<(OpenedValues<Challenge>, Self::Proof), Self::SecretOpenError> {
+        let mut mixed_requests = Vec::new();
+        mixed_requests
+            .try_reserve_exact(requests.len())
+            .map_err(|_| SecretTwoAdicPcsOpenError::AllocationFailed)?;
+        mixed_requests.extend(
+            requests
+                .into_iter()
+                .map(SecretPcsMixedOpeningRequest::Private),
+        );
+        self.open_secret_mixed_guarded_inner(mixed_requests, challenger)
+            .map_err(SecretTwoAdicPcsOpenError::from)
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<Val, Dft, InputMmcs, FriMmcs, Challenge, Challenger>
+    SecretPcsMixedOpener<Challenge, Challenger> for TwoAdicFriPcs<Val, Dft, InputMmcs, FriMmcs>
+where
+    Val: TwoAdicField + PrimeField64 + zeroize::Zeroize,
+    Dft: TwoAdicSubgroupDft<Val> + SecretTwoAdicSubgroupDft<Val> + Sync,
+    InputMmcs: Mmcs<Val, MultiProof: Sync, Error: Sync> + SecretRecomputableMmcs<Val>,
+    InputMmcs::AuthenticationData<RowMajorMatrix<Val>>: zeroize::Zeroize,
+    FriMmcs: Mmcs<Challenge> + SecretMmcs<Challenge>,
+    Challenge: ExtensionField<Val> + zeroize::Zeroize,
+    Challenger:
+        FieldChallenger<Val> + CanObserve<FriMmcs::Commitment> + GrindingChallenger<Witness = Val>,
+{
+    fn open_secret_with_public_preprocessing(
+        &self,
+        requests: Vec<
+            SecretPcsMixedOpeningRequest<'_, Self::ProverData, Self::SecretData, Challenge>,
+        >,
+        challenger: &mut Challenger,
+    ) -> Result<(OpenedValues<Challenge>, Self::Proof), Self::SecretOpenError> {
+        self.open_secret_mixed_guarded_inner(requests, challenger)
+            .map_err(SecretTwoAdicPcsOpenError::from)
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<Val, Dft, InputMmcs, FriMmcs, Challenge, Challenger>
+    SecretUnivariateStarkPcsEvaluator<Challenge, Challenger>
+    for TwoAdicFriPcs<Val, Dft, InputMmcs, FriMmcs>
+where
+    Val: TwoAdicField + PrimeField64 + zeroize::Zeroize,
+    Dft: TwoAdicSubgroupDft<Val> + SecretTwoAdicSubgroupDft<Val> + Sync,
+    InputMmcs: Mmcs<Val, MultiProof: Sync, Error: Sync> + SecretRecomputableMmcs<Val>,
+    InputMmcs::AuthenticationData<RowMajorMatrix<Val>>: zeroize::Zeroize,
+    FriMmcs: Mmcs<Challenge>,
+    Challenge: ExtensionField<Val>,
+    Challenger:
+        FieldChallenger<Val> + CanObserve<FriMmcs::Commitment> + GrindingChallenger<Witness = Val>,
+{
+    type SecretEvaluationError = SecretFriEvaluationError;
+
+    fn get_evaluations_on_domain_secret(
+        &self,
+        prover_data: &SecretProverData<Self::SecretData>,
+        idx: usize,
+        domain: Self::Domain,
+    ) -> Result<SecretProverData<RowMajorMatrix<Val>>, Self::SecretEvaluationError> {
+        self.evaluate_on_domain_secret(prover_data, idx, domain)
+    }
+}
+
 impl<Val, Dft, InputMmcs, FriMmcs, Challenge, Challenger> Pcs<Challenge, Challenger>
     for TwoAdicFriPcs<Val, Dft, InputMmcs, FriMmcs>
 where
@@ -582,46 +3020,6 @@ where
         commitment_data_with_opening_points: Vec<OpeningRequest<'_, Self::ProverData, Challenge>>,
         challenger: &mut Challenger,
     ) -> Result<(OpenedValues<Challenge>, Self::Proof), Self::ProverError> {
-        /*
-
-        A quick rundown of the optimizations in this function:
-        We are trying to compute sum_i alpha^i * (p(X) - y)/(X - z),
-        for each z an opening point, y = p(z). Each p(X) is given as evaluations in bit-reversed order
-        in the columns of the matrices. y is computed by barycentric interpolation.
-        X and p(X) are in the base field; alpha, y and z are in the extension.
-        The primary goal is to minimize extension multiplications.
-
-        - Instead of computing all alpha^i, we just compute alpha^i for i up to the largest width
-        of a matrix, then multiply by an "alpha offset" when accumulating.
-              a^0 x0 + a^1 x1 + a^2 x2 + a^3 x3 + ...
-            = ( a^0 x0 + a^1 x1 ) + a^2 ( a^0 x2 + a^1 x3 ) + ...
-            (see `alpha_pows`, `alpha_pow_offset`, `num_reduced`)
-        For the first point a matrix is opened at, the offset is multiplied into the powers of
-        alpha the matrix is compressed with, so those rows need no separate multiplication.
-            (see `offset_alpha_powers`)
-
-        - For each unique point z, we precompute 1/(X-z) for the largest subgroup opened at this point.
-        Since we compute it in bit-reversed order, smaller subgroups can simply truncate the vector.
-            (see `inv_denoms`)
-
-        - Then, for each matrix (with columns p_i) and opening point z, we want:
-            for each row (corresponding to subgroup element X):
-                reduced[X] += alpha_offset * sum_i [ alpha^i * inv_denom[X] * (p_i[X] - y[i]) ]
-
-            We can factor out inv_denom, and expand what's left:
-                reduced[X] += alpha_offset * inv_denom[X] * sum_i [ alpha^i * p_i[X] - alpha^i * y[i] ]
-
-            And separate the sum:
-                reduced[X] += alpha_offset * inv_denom[X] * [ sum_i [ alpha^i * p_i[X] ] - sum_i [ alpha^i * y[i] ] ]
-
-            And now the last sum doesn't depend on X, so we can precompute that for the matrix, too.
-            So the hot loop (that depends on both X and i) is just:
-                sum_i [ alpha^i * p_i[X] ]
-
-            with alpha^i an extension, p_i[X] a base
-
-        */
-
         // Contained in each `Self::ProverData` is a list of matrices which have been committed to.
         // We extract those matrices to be able to refer to them directly.
         let mats_and_points = commitment_data_with_opening_points
@@ -637,265 +3035,22 @@ where
                         .into_iter()
                         .map(|m| m.as_view())
                         .collect_vec();
-                    debug_assert_eq!(
-                        mats.len(),
-                        points.len(),
-                        "each matrix should have a corresponding set of evaluation points"
-                    );
-                    (mats, points)
+                    (mats, points.as_slice())
                 },
             )
             .collect_vec();
 
-        // Reject every committed height before absorbing claims or starting a driver.
-        for (batch, (matrices, points)) in mats_and_points.iter().enumerate() {
-            for (matrix, (mat, points_for_mat)) in matrices.iter().zip(points.iter()).enumerate() {
-                self.fri
-                    .validate_input_height(log2_strict_usize(mat.height()))?;
-                // Why: the verifier rejects a matrix with no claim, since nothing pins its width.
-                // A proof for it could never verify, so refuse before any transcript work.
-                if points_for_mat.is_empty() {
-                    return Err(FriProverError::MatrixWithoutOpeningPoints { batch, matrix });
-                }
-            }
-        }
+        let PreparedPcsOpening {
+            all_opened_values,
+            fri_input,
+            log_global_max_height,
+            batch_pow_witness,
+            mut transcript,
+        } = self.prepare_opening(&mats_and_points, challenger)?;
 
-        // Find the maximum height and the maximum width of matrices in the batch.
-        // These do not need to correspond to the same matrix.
-        let (global_max_height, global_max_width) = mats_and_points
-            .iter()
-            .flat_map(|(mats, _)| mats.iter().map(|m| (m.height(), m.width())))
-            .reduce(|(hmax, wmax), (h, w)| (hmax.max(h), wmax.max(w)))
-            .expect("No Matrices Supplied?");
-        let log_global_max_height = log2_strict_usize(global_max_height);
-
-        // Get all values of the coset `gH` for the largest necessary subgroup `H`.
-        // We also bit reverse which means that coset has the nice property that
-        // `coset[..2^i]` contains the values of `gK` for `|K| = 2^i`.
-        let coset = {
-            let coset =
-                TwoAdicMultiplicativeCoset::new(Val::GENERATOR, log_global_max_height).unwrap();
-            let mut coset_points = coset.iter().collect();
-            reverse_slice_index_bits(&mut coset_points);
-            coset_points
-        };
-
-        // For each unique opening point z, we will find the largest degree bound
-        // for that point, and precompute 1/(z - X) for the largest subgroup (in bitrev order).
-        let inv_denoms = compute_inverse_denominators(&mats_and_points, &coset);
-        drop(coset);
-
-        // Precompute adjusted barycentric weights once per opening point.
-        // adjusted[i] = 1/(z - x_i) - 1/z, reused across all matrices opened at z.
-        // Every matrix opened at `z` interpolates over a prefix of at most
-        // `denoms.len() >> log_blowup` weights (see `h` below), so that is all we compute.
-        let adjusted_weights: LinearMap<Challenge, Vec<Challenge>> = inv_denoms
-            .iter()
-            .map(|(point, denoms)| {
-                let prefix_len = denoms.len() >> self.fri.log_blowup;
-                (
-                    *point,
-                    compute_adjusted_weights(*point, &denoms[..prefix_len]),
-                )
-            })
-            .collect();
-
-        // Evaluate coset representations and write openings to the challenger
-        let all_opened_values = mats_and_points
-            .iter()
-            .map(|(mats, points)| {
-                // For each collection of matrices
-                izip!(mats.iter(), points.iter())
-                    .map(|(mat, points_for_mat)| {
-                        // Every committed matrix is assumed to be an LDE at `self.fri.log_blowup`;
-                        // `commit`/`commit_ldes` enforce `height >= 1 << log_blowup`. A larger actual
-                        // blowup is still sound, just slightly slower.
-                        // Ideally, polynomials would be passed in with their blow-up factors known.
-
-                        // The point of this correction is that each column of the matrix corresponds to a low degree polynomial.
-                        // Hence we can save time by restricting the height of the matrix to be the minimal height which
-                        // uniquely identifies the polynomial.
-                        let h = mat.height() >> self.fri.log_blowup;
-
-                        // `subgroup` and `mat` are both in bit-reversed order, so we can truncate.
-                        let (low_coset, _) = mat.split_rows(h);
-
-                        points_for_mat
-                            .iter()
-                            .map(|&point| {
-                                let _guard =
-                                    debug_span!("evaluate matrix", dims = %mat.dimensions())
-                                        .entered();
-
-                                // Use Barycentric interpolation to evaluate each column of the matrix at the given point.
-                                debug_span!("compute opened values with Lagrange interpolation")
-                                    .in_scope(|| {
-                                        // Slice the precomputed adjusted weights to match this matrix's height.
-                                        // Zero-allocation hot path: straight to the SIMD dot product.
-                                        let adj = &adjusted_weights.get(&point).unwrap()[..h];
-                                        low_coset.interpolate_coset_with_precomputation(
-                                            Val::GENERATOR,
-                                            point,
-                                            adj,
-                                        )
-                                    })
-                            })
-                            .collect_vec()
-                    })
-                    .collect_vec()
-            })
-            .collect_vec();
-
-        drop(adjusted_weights);
-
-        // Describe the transcript before running it.
-        //
-        // Every number comes from the parameters and the matrices this prover holds.
-        // The verifier builds the identical description from the claims it is handed.
-        let mut transcript = PcsProverTranscript::<Challenger, Val, Challenge>::new(
-            challenger,
-            PcsShape::from_opened_values(&self.fri, &all_opened_values),
-        );
-
-        // Bind every claimed evaluation, in commitment, matrix and point order.
-        transcript.claimed_openings(&all_opened_values);
-
-        // Grind, then draw the challenge that batches the claims just bound.
-        //
-        // Why: the witness commits the prover to those openings before it learns the challenge.
-        // Hunting for a challenge that makes a false batched claim look low degree costs
-        // `2^batch_proof_of_work_bits` work per candidate.
-        //
-        // Soundness error: at minimum `k/|EF|`, over the linear combination
-        //
-        //     sum_i alpha^i * (f_i(zeta) - f_i(x)) / (zeta - x)
-        //
-        // where `k` counts every (function, opening point) pair.
-        // For a univariate STARK that is twice the trace width plus the quotient chunk count.
-        //
-        // This site's error grows with the batch, unlike the query phase's.
-        // On a wide instance over a small field it is what limits proven soundness.
-        let (alpha, batch_pow_witness) = transcript.batch_phase();
-        // A zero difficulty still occupies a slot in the proof, keeping its shape fixed.
-        let batch_pow_witness = batch_pow_witness.unwrap_or(Val::ZERO);
-
-        // We precompute the packed powers of alpha once, up to the widest matrix. Each matrix
-        // compresses its rows (`rowwise_packed_dot_product`) against a prefix of these powers,
-        // scaled by the alpha offset of the first point it is opened at (see
-        // `offset_alpha_powers`); the per-opening combination below unpacks `alpha`'s powers
-        // lazily via `alpha.powers()`, so we never materialize a full unpacked copy.
-        let packed_alpha_powers =
-            Challenge::ExtensionPacking::packed_ext_powers_capped(alpha, global_max_width)
-                .collect_vec();
-
-        // Now that we have sent the openings to the verifier, it remains to prove
-        // that those openings are correct.
-
-        // Given a low degree polynomial `f(x)` with claimed evaluation `f(zeta)`, we can check
-        // that `f(zeta)` is correct by doing a low degree test on `(f(zeta) - f(x))/(zeta - x)`.
-        // We will use `alpha` to batch together both different claimed openings `zeta` and
-        // different polynomials `f` whose evaluation vectors have the same height.
-
-        // TODO: If we allow different polynomials to have different blow_up factors
-        // we may need to revisit this and to ensure it is safe to batch them together.
-
-        // num_reduced records the number of (function, opening point) pairs for each `log_height`.
-        // TODO: This should really be `[0; Val::TWO_ADICITY + 1]` but that runs into issues with generics.
-        let mut num_reduced = [0; 33];
-
-        // For each `log_height` from 2^1 -> 2^32, reduced_openings will contain either `None`
-        // if there are no matrices of that height, or `Some(vec)` where `vec` is equal to
-        // a weighted sum of `(f(zeta) - f(x))/(zeta - x)` over all `f`'s of that height and
-        // for each `f`, all opening points `zeta`. The sum is weighted by powers of the challenge alpha.
-        let mut reduced_openings: [_; 33] = core::array::from_fn(|_| None);
-
-        for ((mats, points), openings_for_round) in
-            mats_and_points.iter().zip(all_opened_values.iter())
-        {
-            for (mat, points_for_mat, openings_for_mat) in
-                izip!(mats.iter(), points.iter(), openings_for_round.iter())
-            {
-                let _guard =
-                    debug_span!("reduce matrix quotient", dims = %mat.dimensions()).entered();
-
-                let log_height = log2_strict_usize(mat.height());
-
-                // If this is our first matrix at this height, initialise reduced_openings to zero.
-                // Otherwise, get a mutable reference to it.
-                let reduced_opening_for_log_height = reduced_openings[log_height]
-                    .get_or_insert_with(|| Challenge::zero_vec(mat.height()));
-                debug_assert_eq!(reduced_opening_for_log_height.len(), mat.height());
-
-                // The first point this matrix is opened at weights it by
-                // `alpha^num_reduced[log_height]` (see below). Scaling the powers of alpha by
-                // that offset folds the weight into the compression.
-                let first_alpha_pow_offset = alpha.exp_u64(num_reduced[log_height] as u64);
-                let offset_alpha_powers = packed_alpha_powers
-                    [..mat.width().div_ceil(Val::Packing::WIDTH)]
-                    .iter()
-                    .map(|&power| power * first_alpha_pow_offset)
-                    .collect_vec();
-
-                // Treating our matrix M as the evaluations of functions f_0, f_1, ...
-                // Compute the evaluations of `first_alpha_pow_offset * Mred(x)` where
-                // `Mred(x) = f_0(x) + alpha*f_1(x) + ...`
-                let mat_compressed = debug_span!("compress mat").in_scope(|| {
-                    // This will be reused for all points z which M is opened at so we collect into a vector.
-                    mat.rowwise_packed_dot_product::<Challenge>(&offset_alpha_powers)
-                        .collect::<Vec<_>>()
-                });
-
-                for (point_index, (&point, openings)) in
-                    points_for_mat.iter().zip(openings_for_mat).enumerate()
-                {
-                    // If we have multiple matrices at the same height, we need to scale alpha to combine them.
-                    // This means that reduced_openings will contain:
-                    // Mred_0(x) + alpha^{M_0.width()}Mred_1(x) + alpha^{M_0.width() + M_1.width()}Mred_2(x) + ...
-                    // Where M_0, M_1, ... are the matrices of the same height.
-                    let alpha_pow_offset = alpha.exp_u64(num_reduced[log_height] as u64);
-
-                    // As we have all the openings `f_i(z)`, we can combine them using `alpha`
-                    // in an identical way to before to compute `Mred(z)`.
-                    let reduced_openings: Challenge =
-                        dot_product(alpha.powers(), openings.iter().copied());
-                    let weighted_openings = alpha_pow_offset * reduced_openings;
-
-                    let rows = mat_compressed
-                        .par_iter()
-                        .zip(reduced_opening_for_log_height.par_iter_mut())
-                        // inv_denoms contains `1/(z - x)` for `x` in a coset `gK`.
-                        // If `|K| =/= mat.height()` we actually want a subset of this
-                        // corresponding to the evaluations over `gH` for `|H| = mat.height()`.
-                        // As inv_denoms is bit reversed, the evaluations over `gH` are exactly
-                        // the evaluations over `gK` at the indices `0..mat.height()`.
-                        // So zip will truncate to the desired smaller length.
-                        .zip(inv_denoms.get(&point).unwrap().par_iter());
-
-                    // Map the function `Mred(x) -> (Mred(z) - Mred(x))/(z - x)`
-                    // across the evaluation vector of `Mred(x)`, weighted by `alpha_pow_offset`.
-                    // The first point needs no rescale, saving an extension multiplication per row.
-                    if point_index == 0 {
-                        rows.for_each(|((&reduced_row, ro), &inv_denom)| {
-                            *ro += (weighted_openings - reduced_row) * inv_denom;
-                        });
-                    } else {
-                        // `alpha_pow_offset = first_alpha_pow_offset * rescale`, since every
-                        // earlier point of this matrix advanced the offset by `mat.width()`.
-                        let rescale = alpha.exp_u64((point_index * mat.width()) as u64);
-                        rows.for_each(|((&reduced_row, ro), &inv_denom)| {
-                            *ro += (weighted_openings - rescale * reduced_row) * inv_denom;
-                        });
-                    }
-                    num_reduced[log_height] += mat.width();
-                }
-            }
-        }
-
-        drop(inv_denoms);
-
-        // It remains to prove that all evaluation vectors in reduced_openings correspond to
-        // low degree functions.
-        let fri_input = reduced_openings.into_iter().rev().flatten().collect_vec();
+        // Quotient reduction owns everything FRI needs. End every immutable matrix borrow before
+        // query selection so the guarded path can detach and erase commitment data at this point.
+        drop(mats_and_points);
 
         let folding: TwoAdicFriFoldingForMmcs<Val, InputMmcs> = TwoAdicFriFolding(PhantomData);
 
@@ -1127,11 +3282,11 @@ where
 /// Compute vectors of inverse denominators for each unique opening point.
 ///
 /// Arguments:
-/// - `mats_and_points` is a list of matrices and for each matrix a list of points. We assume that
+/// - `dimensions_and_points` is a list of matrix dimensions and for each matrix a list of points. We assume that
 ///    the total number of distinct points is very small as several methods contained herein are `O(n^2)`
 ///    in the number of points.
 /// - `coset` is the set of points `gH` where `H` a two-adic subgroup such that `|H|` is greater
-///     than or equal to the largest height of any matrix in `mats_and_points`. The values
+///     than or equal to the largest requested matrix height. The values
 ///     in `coset` must be in bit-reversed order.
 ///
 /// For each point `z`, let `M` be the matrix of largest height which opens at `z`.
@@ -1140,16 +3295,16 @@ where
 ///
 /// Return a LinearMap which allows us to recover the computed vectors for each `z`.
 #[instrument(skip_all)]
-fn compute_inverse_denominators<F: TwoAdicField, EF: ExtensionField<F>, M: Matrix<F>>(
-    mats_and_points: &[(Vec<M>, &Vec<Vec<EF>>)],
+fn compute_inverse_denominators_for_dimensions<F: TwoAdicField, EF: ExtensionField<F>>(
+    dimensions_and_points: &[OpeningDimensionsAndPoints<'_, EF>],
     coset: &[F],
 ) -> LinearMap<EF, Vec<EF>> {
     // For each `z`, find the maximal height of any matrix which we need to
     // open at `z`.
     let mut max_log_height_for_point: LinearMap<EF, usize> = LinearMap::new();
-    for (mats, points) in mats_and_points {
-        for (mat, points_for_mat) in izip!(mats, *points) {
-            let log_height = log2_strict_usize(mat.height());
+    for (dimensions, points) in dimensions_and_points {
+        for (matrix_dimensions, points_for_mat) in izip!(dimensions, *points) {
+            let log_height = log2_strict_usize(matrix_dimensions.height);
             for &z in points_for_mat {
                 if let Some(lh) = max_log_height_for_point.get_mut(&z) {
                     *lh = core::cmp::max(*lh, log_height);
@@ -1180,15 +3335,26 @@ mod tests {
     use p3_baby_bear::{BabyBear, Poseidon2BabyBear};
     use p3_challenger::DuplexChallenger;
     use p3_commit::ExtensionMmcs;
+    #[cfg(feature = "secret-memory")]
+    use p3_commit::{
+        SecretDetachedPcsCommitter, SecretMmcs, SecretPcsCommitter, SecretProverData,
+        SecretUnivariateStarkPcsCommitter, SecretUnivariateStarkPcsEvaluator,
+    };
+    #[cfg(feature = "secret-memory")]
+    use p3_dft::Radix2Bowers;
     use p3_dft::Radix2Dit;
     use p3_field::extension::BinomialExtensionField;
     use p3_field::{Field, PrimeCharacteristicRing};
     use p3_goldilocks::Goldilocks;
     use p3_matrix::dense::RowMajorMatrixView;
+    #[cfg(feature = "secret-memory")]
+    use p3_merkle_tree::MerkleTreeHidingMmcs;
     use p3_merkle_tree::MerkleTreeMmcs;
     use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
     use rand::distr::{Distribution, StandardUniform};
     use rand::rngs::SmallRng;
+    #[cfg(feature = "secret-memory")]
+    use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
 
     use super::*;
@@ -1244,15 +3410,18 @@ mod tests {
                     .collect_vec();
                 let first_points = point_lists[..4].to_vec();
                 let last_points = point_lists[4..].to_vec();
-                let mats = log_heights
+                let dimensions = log_heights
                     .iter()
-                    .map(|&log_height| RowMajorMatrix::new(vec![Base::ZERO; 1 << log_height], 1))
+                    .map(|&log_height| Dimensions {
+                        width: 1,
+                        height: 1 << log_height,
+                    })
                     .collect_vec();
                 let rounds = vec![
-                    (mats[..4].to_vec(), &first_points),
-                    (mats[4..].to_vec(), &last_points),
+                    (dimensions[..4].to_vec(), first_points.as_slice()),
+                    (dimensions[4..].to_vec(), last_points.as_slice()),
                 ];
-                let inverses = compute_inverse_denominators(&rounds, &coset);
+                let inverses = compute_inverse_denominators_for_dimensions(&rounds, &coset);
                 for (i, &z) in points.iter().enumerate() {
                     let log_height = log_heights[i.min(7)];
                     let expected = (0..1 << log_height)
@@ -1282,8 +3451,14 @@ mod tests {
     #[should_panic(expected = "Tried to invert zero")]
     fn inverse_denominators_reject_zero_in_a_small_domain() {
         let points = vec![vec![EF::ONE]];
-        let rounds = vec![(vec![RowMajorMatrix::new(vec![F::ZERO], 1)], &points)];
-        compute_inverse_denominators(&rounds, &[F::ONE]);
+        let rounds = vec![(
+            vec![Dimensions {
+                width: 1,
+                height: 1,
+            }],
+            points.as_slice(),
+        )];
+        compute_inverse_denominators_for_dimensions(&rounds, &[F::ONE]);
     }
 
     #[test]
@@ -1295,10 +3470,1078 @@ mod tests {
             .collect_vec();
         let points = vec![vec![EF::from(coset[1025])]];
         let rounds = vec![(
-            vec![RowMajorMatrix::new(vec![F::ZERO; 1 << 11], 1)],
-            &points,
+            vec![Dimensions {
+                width: 1,
+                height: 1 << 11,
+            }],
+            points.as_slice(),
         )];
-        compute_inverse_denominators(&rounds, &coset);
+        compute_inverse_denominators_for_dimensions(&rounds, &coset);
+    }
+
+    #[cfg(feature = "secret-memory")]
+    type SecretCommitPcs = TwoAdicFriPcs<F, Radix2Bowers, ValMmcs, ChallengeMmcs>;
+
+    #[cfg(feature = "secret-memory")]
+    type HidingValMmcs = MerkleTreeHidingMmcs<
+        <F as Field>::Packing,
+        <F as Field>::Packing,
+        MyHash,
+        MyCompress,
+        StdRng,
+        2,
+        8,
+        4,
+    >;
+
+    #[cfg(feature = "secret-memory")]
+    type SecretHidingMerklePcs = TwoAdicFriPcs<F, Radix2Bowers, HidingValMmcs, ChallengeMmcs>;
+
+    #[cfg(feature = "secret-memory")]
+    fn make_secret_commit_pcs() -> SecretCommitPcs {
+        let mut rng = SmallRng::seed_from_u64(0x5345_4352_4554_5043);
+        let permutation = Perm::new_from_rng_128(&mut rng);
+        let hash = MyHash::new(permutation.clone());
+        let compress = MyCompress::new(permutation);
+        let val_mmcs = ValMmcs::new(hash.clone(), compress.clone(), 0);
+        let challenge_mmcs = ChallengeMmcs::new(ValMmcs::new(hash, compress, 0));
+        SecretCommitPcs::new(
+            Radix2Bowers,
+            val_mmcs,
+            FriParameters {
+                log_blowup: 1,
+                log_final_poly_len: 0,
+                max_log_arity: 1,
+                num_queries: 2,
+                batch_proof_of_work_bits: 0,
+                commit_proof_of_work_bits: 0,
+                query_proof_of_work_bits: 0,
+                mmcs: challenge_mmcs,
+            },
+        )
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_detached_commit_matches_retained_commit_and_opens() {
+        const DOMAIN_SIZE: usize = 8;
+        let pcs = make_secret_commit_pcs();
+        let mut permutation_rng = SmallRng::seed_from_u64(0x5345_4352_4554_5043);
+        let permutation = Perm::new_from_rng_128(&mut permutation_rng);
+        let domain =
+            <SecretCommitPcs as Pcs<EF, Challenger>>::natural_domain_for_degree(&pcs, DOMAIN_SIZE);
+        let matrices = [2, 3].map(|width| {
+            let value_count = DOMAIN_SIZE
+                .checked_mul(width)
+                .expect("fixed test dimensions must fit");
+            RowMajorMatrix::new(
+                (0..value_count)
+                    .map(|index| F::from_usize(index + 1))
+                    .collect_vec(),
+                width,
+            )
+        });
+
+        let retained_evaluations = matrices
+            .clone()
+            .into_iter()
+            .map(|matrix| (domain, SecretProverData::new(matrix)))
+            .collect();
+        let (retained_commitment, mut retained_data) =
+            <SecretCommitPcs as SecretPcsCommitter<EF, Challenger>>::commit_secret(
+                &pcs,
+                retained_evaluations,
+            )
+            .expect("valid retained commitment must succeed");
+        let detached_evaluations = matrices
+            .into_iter()
+            .map(|matrix| (domain, SecretProverData::new(matrix)))
+            .collect();
+        let (detached_commitment, mut detached_data) =
+            <SecretCommitPcs as SecretDetachedPcsCommitter<EF, Challenger>>::commit_detached_secret(
+                &pcs,
+                detached_evaluations,
+            )
+            .expect("valid detached commitment must succeed");
+
+        assert_eq!(detached_commitment, retained_commitment);
+        assert!(retained_data.authentication_data.is_none());
+        assert!(detached_data.authentication_data.is_some());
+        assert!(
+            pcs.mmcs
+                .get_matrices_secret(&detached_data.commitment_data)
+                .is_empty()
+        );
+
+        let mut retained_challenger = Challenger::new(permutation.clone());
+        retained_challenger.observe(&retained_commitment);
+        let retained_zeta: EF = retained_challenger.sample_algebra_element();
+        let retained_opening = <SecretCommitPcs as SecretPcsOpener<EF, Challenger>>::open_secret(
+            &pcs,
+            vec![
+                (
+                    &mut retained_data,
+                    vec![vec![retained_zeta], vec![retained_zeta]],
+                )
+                    .into(),
+            ],
+            &mut retained_challenger,
+        )
+        .expect("retained commitment opening must succeed");
+
+        let mut detached_challenger = Challenger::new(permutation.clone());
+        detached_challenger.observe(&detached_commitment);
+        let detached_zeta: EF = detached_challenger.sample_algebra_element();
+        assert_eq!(detached_zeta, retained_zeta);
+        let detached_opening = <SecretCommitPcs as SecretPcsOpener<EF, Challenger>>::open_secret(
+            &pcs,
+            vec![
+                (
+                    &mut detached_data,
+                    vec![vec![detached_zeta], vec![detached_zeta]],
+                )
+                    .into(),
+            ],
+            &mut detached_challenger,
+        )
+        .expect("detached commitment opening must succeed");
+        assert_eq!(detached_opening.0, retained_opening.0);
+        assert_eq!(
+            detached_challenger.sample_algebra_element::<EF>(),
+            retained_challenger.sample_algebra_element::<EF>()
+        );
+
+        let claims: Claims = vec![
+            (
+                detached_commitment,
+                detached_opening.0[0]
+                    .iter()
+                    .map(|matrix| (domain, vec![(detached_zeta, matrix[0].clone())]))
+                    .collect(),
+            )
+                .into(),
+        ];
+        let mut verifier_challenger = Challenger::new(permutation);
+        verifier_challenger.observe(&claims[0].commitment);
+        let verifier_zeta: EF = verifier_challenger.sample_algebra_element();
+        assert_eq!(verifier_zeta, detached_zeta);
+        <SecretCommitPcs as Pcs<EF, Challenger>>::verify(
+            &pcs,
+            claims,
+            &detached_opening.1,
+            &mut verifier_challenger,
+        )
+        .expect("ordinary PCS verifier must accept the detached opening");
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_domain_evaluation_matches_ordinary_pcs_on_generator_and_disjoint_cosets() {
+        const DOMAIN_SIZE: usize = 8;
+        const WIDTH: usize = 2;
+        let pcs = make_secret_commit_pcs();
+        let domain =
+            <SecretCommitPcs as Pcs<EF, Challenger>>::natural_domain_for_degree(&pcs, DOMAIN_SIZE);
+        let matrix = RowMajorMatrix::new((1_u8..=16).map(F::from_u8).collect::<Vec<_>>(), WIDTH);
+        let (_, ordinary_data) =
+            <SecretCommitPcs as Pcs<EF, Challenger>>::commit(&pcs, [(domain, matrix.clone())])
+                .expect("valid ordinary commitment must succeed");
+        let (_, guarded_data) =
+            <SecretCommitPcs as SecretPcsCommitter<EF, Challenger>>::commit_secret(
+                &pcs,
+                vec![(domain, SecretProverData::new(matrix))],
+            )
+            .expect("valid guarded commitment must succeed");
+
+        let smaller_generator_domain = TwoAdicMultiplicativeCoset::new(F::GENERATOR, 2)
+            .expect("test smaller generator domain must be valid");
+        let generator_domain = TwoAdicMultiplicativeCoset::new(F::GENERATOR, 3)
+            .expect("test generator domain must be valid");
+        let disjoint_domain = domain.create_disjoint_domain(
+            DOMAIN_SIZE
+                .checked_mul(4)
+                .expect("fixed test domain size must fit"),
+        );
+        for target_domain in [smaller_generator_domain, generator_domain, disjoint_domain] {
+            let expected =
+                <SecretCommitPcs as UnivariateStarkPcs<EF, Challenger>>::get_evaluations_on_domain(
+                    &pcs,
+                    &ordinary_data,
+                    0,
+                    target_domain,
+                )
+                .to_row_major_matrix();
+            let actual = <SecretCommitPcs as SecretUnivariateStarkPcsEvaluator<
+                EF,
+                Challenger,
+            >>::get_evaluations_on_domain_secret(&pcs, &guarded_data, 0, target_domain)
+            .expect("valid guarded domain evaluation must succeed");
+
+            assert_eq!(actual.width, expected.width);
+            assert_eq!(actual.values, expected.values);
+        }
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_split_coset_evaluations_are_exact_interleaved_full_domain_rows() {
+        const SOURCE_SIZE: usize = 16;
+        const TARGET_SIZE: usize = 64;
+        const NUM_CHUNKS: usize = 8;
+        const WIDTH: usize = 3;
+
+        let pcs = make_secret_commit_pcs();
+        let source_domain =
+            <SecretCommitPcs as Pcs<EF, Challenger>>::natural_domain_for_degree(&pcs, SOURCE_SIZE);
+        let source_len = SOURCE_SIZE
+            .checked_mul(WIDTH)
+            .expect("fixed test dimensions must fit");
+        let source = RowMajorMatrix::new(
+            (0..source_len)
+                .map(|index| F::from_usize(index + 1))
+                .collect_vec(),
+            WIDTH,
+        );
+        let (_, guarded_data) =
+            <SecretCommitPcs as SecretPcsCommitter<EF, Challenger>>::commit_secret(
+                &pcs,
+                vec![(source_domain, SecretProverData::new(source))],
+            )
+            .expect("valid guarded commitment must succeed");
+        let full_domain = source_domain.create_disjoint_domain(TARGET_SIZE);
+        let full = <SecretCommitPcs as SecretUnivariateStarkPcsEvaluator<EF, Challenger>>::
+            get_evaluations_on_domain_secret(&pcs, &guarded_data, 0, full_domain)
+            .expect("full guarded domain evaluation must succeed");
+
+        for (chunk_index, chunk_domain) in full_domain
+            .split_domains(NUM_CHUNKS)
+            .into_iter()
+            .enumerate()
+        {
+            let chunk = <SecretCommitPcs as SecretUnivariateStarkPcsEvaluator<
+                EF,
+                Challenger,
+            >>::get_evaluations_on_domain_secret(&pcs, &guarded_data, 0, chunk_domain)
+            .expect("split guarded domain evaluation must succeed");
+            assert_eq!(chunk.width, WIDTH);
+            assert_eq!(chunk.height(), TARGET_SIZE / NUM_CHUNKS);
+
+            for local_row in 0..chunk.height() {
+                let full_row = local_row
+                    .checked_mul(NUM_CHUNKS)
+                    .and_then(|row| row.checked_add(chunk_index))
+                    .expect("fixed test row mapping must fit");
+                for column in 0..WIDTH {
+                    assert_eq!(chunk.get(local_row, column), full.get(full_row, column));
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_domain_evaluation_rejects_invalid_index_and_mismatched_blowup() {
+        const DOMAIN_SIZE: usize = 8;
+        let pcs = make_secret_commit_pcs();
+        let domain =
+            <SecretCommitPcs as Pcs<EF, Challenger>>::natural_domain_for_degree(&pcs, DOMAIN_SIZE);
+        let matrix = RowMajorMatrix::new(vec![F::ONE; DOMAIN_SIZE], 1);
+        let (_, mut guarded_data) =
+            <SecretCommitPcs as SecretPcsCommitter<EF, Challenger>>::commit_secret(
+                &pcs,
+                vec![(domain, SecretProverData::new(matrix))],
+            )
+            .expect("valid guarded commitment must succeed");
+
+        let invalid_index = <SecretCommitPcs as SecretUnivariateStarkPcsEvaluator<
+            EF,
+            Challenger,
+        >>::get_evaluations_on_domain_secret(
+            &pcs, &guarded_data, 1, domain
+        );
+        assert!(matches!(
+            invalid_index,
+            Err(SecretFriEvaluationError::MatrixIndexOutOfBounds {
+                index: 1,
+                matrix_count: 1
+            })
+        ));
+
+        guarded_data.log_blowup = guarded_data
+            .log_blowup
+            .checked_add(1)
+            .expect("fixed test blowup increment must fit");
+        let mismatched_blowup = <SecretCommitPcs as SecretUnivariateStarkPcsEvaluator<
+            EF,
+            Challenger,
+        >>::get_evaluations_on_domain_secret(
+            &pcs, &guarded_data, 0, domain
+        );
+        assert!(matches!(
+            mismatched_blowup,
+            Err(SecretFriEvaluationError::RetainedBlowupMismatch)
+        ));
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn retained_lde_dimensions_rejects_zero_width_without_panicking() {
+        const DOMAIN_SIZE: usize = 8;
+        let pcs = make_secret_commit_pcs();
+        let domain =
+            <SecretCommitPcs as Pcs<EF, Challenger>>::natural_domain_for_degree(&pcs, DOMAIN_SIZE);
+        let matrix = RowMajorMatrix::new(vec![F::ONE; DOMAIN_SIZE], 1);
+        let (_, mut prover_data) =
+            <SecretCommitPcs as SecretPcsCommitter<EF, Challenger>>::commit_secret(
+                &pcs,
+                vec![(domain, SecretProverData::new(matrix))],
+            )
+            .expect("valid guarded commitment must succeed");
+        prover_data.coefficients[0].width = 0;
+
+        assert!(matches!(
+            prover_data.retained_lde_dimensions(),
+            Err(SecretMatrixError::InvalidShape)
+        ));
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_coefficient_opening_matches_independent_coset_interpolation() {
+        const DOMAIN_SIZE: usize = 8;
+        const WIDTH: usize = 3;
+
+        let pcs = make_secret_commit_pcs();
+        let domain =
+            <SecretCommitPcs as Pcs<EF, Challenger>>::natural_domain_for_degree(&pcs, DOMAIN_SIZE);
+        let matrix = RowMajorMatrix::new(
+            (0..DOMAIN_SIZE * WIDTH)
+                .map(|value| F::from_usize(value + 1))
+                .collect_vec(),
+            WIDTH,
+        );
+        let (_, guarded_data) =
+            <SecretCommitPcs as SecretPcsCommitter<EF, Challenger>>::commit_secret(
+                &pcs,
+                vec![(domain, SecretProverData::new(matrix.clone()))],
+            )
+            .expect("valid guarded commitment must succeed");
+        let coefficients = guarded_data
+            .coefficients
+            .first()
+            .expect("test commitment must retain one coefficient matrix");
+
+        for point_value in [31_u16, 127_u16, 1021_u16] {
+            let point = EF::from(F::from_u16(point_value));
+            let expected = matrix.interpolate_coset(domain.shift(), point);
+            let actual =
+                SecretCommitPcs::evaluate_coefficients_at_point_secret(coefficients, point)
+                    .expect("valid retained coefficients must evaluate");
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_pcs_opening_constructs_a_proof_accepted_by_the_ordinary_verifier() {
+        const DOMAIN_SIZE: usize = 8;
+        let pcs = make_secret_commit_pcs();
+        let mut permutation_rng = SmallRng::seed_from_u64(0x5345_4352_4554_5043);
+        let permutation = Perm::new_from_rng_128(&mut permutation_rng);
+        let domain =
+            <SecretCommitPcs as Pcs<EF, Challenger>>::natural_domain_for_degree(&pcs, DOMAIN_SIZE);
+
+        let mut trace_rng = SmallRng::seed_from_u64(0x4755_4152_4445_4450);
+        let matrices = [2, 3]
+            .map(|width| RowMajorMatrix::<F>::rand_nonzero(&mut trace_rng, DOMAIN_SIZE, width));
+        let (ordinary_commitment, ordinary_data) =
+            <SecretCommitPcs as Pcs<EF, Challenger>>::commit(
+                &pcs,
+                matrices.clone().into_iter().map(|matrix| (domain, matrix)),
+            )
+            .expect("valid ordinary commitment must succeed");
+        let guarded_evaluations = matrices
+            .into_iter()
+            .map(|matrix| (domain, SecretProverData::new(matrix)))
+            .collect();
+        let (commitment, mut prover_data) = <SecretCommitPcs as SecretPcsCommitter<
+            EF,
+            Challenger,
+        >>::commit_secret(&pcs, guarded_evaluations)
+        .expect("valid guarded commitment must succeed");
+        assert_eq!(commitment, ordinary_commitment);
+
+        let mut ordinary_challenger = Challenger::new(permutation.clone());
+        ordinary_challenger.observe(&ordinary_commitment);
+        let ordinary_zeta: EF = ordinary_challenger.sample_algebra_element();
+        let (ordinary_opened_values, ordinary_proof) =
+            <SecretCommitPcs as Pcs<EF, Challenger>>::open(
+                &pcs,
+                vec![
+                    (
+                        &ordinary_data,
+                        vec![vec![ordinary_zeta], vec![ordinary_zeta]],
+                    )
+                        .into(),
+                ],
+                &mut ordinary_challenger,
+            )
+            .expect("valid ordinary opening must succeed");
+
+        let mut prover_challenger = Challenger::new(permutation.clone());
+        prover_challenger.observe(&commitment);
+        let zeta: EF = prover_challenger.sample_algebra_element();
+        assert_eq!(zeta, ordinary_zeta);
+        let (opened_values, proof) =
+            <SecretCommitPcs as SecretPcsOpener<EF, Challenger>>::open_secret(
+                &pcs,
+                vec![(&mut prover_data, vec![vec![zeta], vec![zeta]]).into()],
+                &mut prover_challenger,
+            )
+            .expect("guarded PCS opening must succeed");
+        assert_eq!(opened_values, ordinary_opened_values);
+        assert_eq!(proof.batch_pow_witness, ordinary_proof.batch_pow_witness);
+        assert_eq!(
+            proof.commit_phase_commits,
+            ordinary_proof.commit_phase_commits
+        );
+        assert_eq!(
+            proof.commit_pow_witnesses,
+            ordinary_proof.commit_pow_witnesses
+        );
+        assert_eq!(proof.final_poly, ordinary_proof.final_poly);
+        assert_eq!(proof.query_pow_witness, ordinary_proof.query_pow_witness);
+        assert_eq!(
+            proof.input_openings.len(),
+            ordinary_proof.input_openings.len()
+        );
+        for (guarded, ordinary) in proof
+            .input_openings
+            .iter()
+            .zip(&ordinary_proof.input_openings)
+        {
+            assert_eq!(guarded.opened_values, ordinary.opened_values);
+            assert_eq!(
+                guarded.opening_proof.sibling_hashes,
+                ordinary.opening_proof.sibling_hashes
+            );
+        }
+        assert_eq!(
+            proof.commit_phase_openings.len(),
+            ordinary_proof.commit_phase_openings.len()
+        );
+        for (guarded, ordinary) in proof
+            .commit_phase_openings
+            .iter()
+            .zip(&ordinary_proof.commit_phase_openings)
+        {
+            assert_eq!(guarded.sibling_values, ordinary.sibling_values);
+            assert_eq!(
+                guarded.opening_proof.sibling_hashes,
+                ordinary.opening_proof.sibling_hashes
+            );
+        }
+        assert_eq!(
+            prover_challenger.sample_algebra_element::<EF>(),
+            ordinary_challenger.sample_algebra_element::<EF>()
+        );
+
+        let retained_matrices = pcs.mmcs.get_matrices_secret(&prover_data.commitment_data);
+        assert!(retained_matrices.iter().all(|matrix| {
+            matrix.width == 0 && matrix.values.iter().all(|value| *value == F::ZERO)
+        }));
+        assert!(prover_data.coefficients.is_empty());
+
+        let claims: Claims = vec![
+            (
+                commitment,
+                opened_values[0]
+                    .iter()
+                    .map(|matrix| (domain, vec![(zeta, matrix[0].clone())]))
+                    .collect(),
+            )
+                .into(),
+        ];
+        let mut verifier_challenger = Challenger::new(permutation);
+        verifier_challenger.observe(&claims[0].commitment);
+        let verifier_zeta: EF = verifier_challenger.sample_algebra_element();
+        assert_eq!(verifier_zeta, zeta);
+
+        <SecretCommitPcs as Pcs<EF, Challenger>>::verify(
+            &pcs,
+            claims,
+            &proof,
+            &mut verifier_challenger,
+        )
+        .expect("ordinary PCS verification must accept the guarded proof");
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_pcs_opening_rejects_invalid_retained_geometry_before_detachment() {
+        const DOMAIN_SIZE: usize = 8;
+        let pcs = make_secret_commit_pcs();
+        let mut permutation_rng = SmallRng::seed_from_u64(0x5345_4352_4554_5043);
+        let permutation = Perm::new_from_rng_128(&mut permutation_rng);
+        let domain =
+            <SecretCommitPcs as Pcs<EF, Challenger>>::natural_domain_for_degree(&pcs, DOMAIN_SIZE);
+        let matrix = RowMajorMatrix::new(vec![F::ONE; DOMAIN_SIZE], 1);
+        let (commitment, mut prover_data) =
+            <SecretCommitPcs as SecretPcsCommitter<EF, Challenger>>::commit_secret(
+                &pcs,
+                vec![(domain, SecretProverData::new(matrix))],
+            )
+            .expect("valid guarded commitment must succeed");
+        prover_data.log_blowup = prover_data
+            .log_blowup
+            .checked_add(1)
+            .expect("test blowup increment must fit");
+
+        let mut challenger = Challenger::new(permutation);
+        challenger.observe(&commitment);
+        let zeta: EF = challenger.sample_algebra_element();
+        let result = <SecretCommitPcs as SecretPcsOpener<EF, Challenger>>::open_secret(
+            &pcs,
+            vec![(&mut prover_data, vec![vec![zeta]]).into()],
+            &mut challenger,
+        );
+
+        assert!(matches!(
+            result,
+            Err(SecretTwoAdicPcsOpenError::Preparation)
+        ));
+        let matrices = pcs.mmcs.get_matrices_secret(&prover_data.commitment_data);
+        assert_eq!(matrices.len(), 1);
+        assert!(prover_data.authentication_data.is_none());
+        assert!(!prover_data.coefficients.is_empty());
+    }
+
+    #[cfg(feature = "secret-memory")]
+    fn make_secret_hiding_merkle_pcs() -> SecretHidingMerklePcs {
+        let mut rng = SmallRng::seed_from_u64(0x5345_4352_4554_484d);
+        let permutation = Perm::new_from_rng_128(&mut rng);
+        let hash = MyHash::new(permutation.clone());
+        let compress = MyCompress::new(permutation);
+        let val_mmcs = HidingValMmcs::new(
+            hash.clone(),
+            compress.clone(),
+            0,
+            StdRng::seed_from_u64(0x4d45_524b_4c45_5341),
+        );
+        let challenge_mmcs = ChallengeMmcs::new(ValMmcs::new(hash, compress, 0));
+        SecretHidingMerklePcs::new(
+            Radix2Bowers,
+            val_mmcs,
+            FriParameters {
+                log_blowup: 1,
+                log_final_poly_len: 0,
+                max_log_arity: 1,
+                num_queries: 2,
+                batch_proof_of_work_bits: 0,
+                commit_proof_of_work_bits: 0,
+                query_proof_of_work_bits: 0,
+                mmcs: challenge_mmcs,
+            },
+        )
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_pcs_recomputes_hiding_opening_after_erasing_full_lde() {
+        const DOMAIN_SIZE: usize = 8;
+        const WIDTH: usize = 2;
+        const LDE_HEIGHT: usize = DOMAIN_SIZE * 2;
+
+        let pcs = make_secret_hiding_merkle_pcs();
+        let domain = <SecretHidingMerklePcs as Pcs<EF, Challenger>>::natural_domain_for_degree(
+            &pcs,
+            DOMAIN_SIZE,
+        );
+        let matrix = RowMajorMatrix::new(
+            (0..DOMAIN_SIZE * WIDTH)
+                .map(|value| F::from_usize(value + 1))
+                .collect_vec(),
+            WIDTH,
+        );
+        let (commitment, mut prover_data) =
+            <SecretHidingMerklePcs as SecretPcsCommitter<EF, Challenger>>::commit_secret(
+                &pcs,
+                vec![(domain, SecretProverData::new(matrix))],
+            )
+            .expect("valid guarded commitment must succeed");
+
+        let indices = [0, 3, LDE_HEIGHT - 1];
+        let baseline = pcs
+            .mmcs
+            .open_multi_batch_secret(&indices, &prover_data.commitment_data)
+            .expect("live guarded LDE must open");
+        let original = pcs.mmcs.get_matrices_secret(&prover_data.commitment_data);
+        let original_matrix = original
+            .first()
+            .expect("fixture commitment must retain one matrix");
+        let original_values = original_matrix.values.clone();
+        let reconstructed_full = pcs
+            .recompute_lde_matrix_secret(&prover_data, 0)
+            .expect("complete guarded LDE must be reconstructable");
+        assert_eq!(reconstructed_full.width, original_matrix.width);
+        assert_eq!(reconstructed_full.values, original_matrix.values);
+        drop(reconstructed_full);
+        drop(original);
+        assert!(matches!(
+            pcs.recompute_lde_matrix_secret(&prover_data, 1),
+            Err(SecretFriCommitError::MatrixIndexOutOfBounds {
+                index: 1,
+                matrix_count: 1
+            })
+        ));
+        let reconstructed = pcs
+            .detach_and_open_multi_batch_secret(&indices, &mut prover_data)
+            .expect("guarded PCS must reconstruct and authenticate selected rows");
+        assert!(
+            pcs.mmcs
+                .get_matrices_secret(&prover_data.commitment_data)
+                .is_empty()
+        );
+        assert!(prover_data.authentication_data.is_some());
+        let reconstructed_after_detachment = pcs
+            .recompute_lde_matrix_secret(&prover_data, 0)
+            .expect("detached commitment must retain enough data to rebuild its LDE");
+        assert_eq!(reconstructed_after_detachment.width, WIDTH);
+        assert_eq!(reconstructed_after_detachment.values, original_values);
+        assert!(matches!(
+            pcs.detach_commitment_data_secret(&mut prover_data),
+            Err(SecretFriCommitError::CommitmentAlreadyDetached)
+        ));
+        assert_eq!(reconstructed.opened_values, baseline.0);
+        assert_eq!(reconstructed.opening_proof.0, baseline.1.0);
+        pcs.mmcs
+            .verify_multi_batch(
+                &commitment,
+                &[p3_matrix::Dimensions {
+                    width: WIDTH,
+                    height: LDE_HEIGHT,
+                }],
+                &indices,
+                &reconstructed.opened_values,
+                &reconstructed.opening_proof,
+            )
+            .expect("reconstructed hiding opening must verify against the original cap");
+
+        let out_of_bounds = pcs.recompute_lde_rows_secret(&prover_data, &[LDE_HEIGHT]);
+        assert!(matches!(
+            out_of_bounds,
+            Err(SecretFriCommitError::Dft(
+                SecretDftError::QueryIndexOutOfBounds {
+                    index: LDE_HEIGHT,
+                    height: LDE_HEIGHT
+                }
+            ))
+        ));
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_pcs_detached_opening_preserves_mixed_height_index_semantics() {
+        const LARGE_DOMAIN_SIZE: usize = 8;
+        const SMALL_DOMAIN_SIZE: usize = 4;
+        const LARGE_WIDTH: usize = 2;
+        const SMALL_WIDTH: usize = 1;
+        const LARGE_LDE_HEIGHT: usize = LARGE_DOMAIN_SIZE * 2;
+        const SMALL_LDE_HEIGHT: usize = SMALL_DOMAIN_SIZE * 2;
+
+        let pcs = make_secret_hiding_merkle_pcs();
+        let large_domain =
+            <SecretHidingMerklePcs as Pcs<EF, Challenger>>::natural_domain_for_degree(
+                &pcs,
+                LARGE_DOMAIN_SIZE,
+            );
+        let small_domain =
+            <SecretHidingMerklePcs as Pcs<EF, Challenger>>::natural_domain_for_degree(
+                &pcs,
+                SMALL_DOMAIN_SIZE,
+            );
+        let large_matrix = RowMajorMatrix::new(
+            (0..LARGE_DOMAIN_SIZE * LARGE_WIDTH)
+                .map(|value| F::from_usize(value + 1))
+                .collect_vec(),
+            LARGE_WIDTH,
+        );
+        let small_matrix = RowMajorMatrix::new(
+            (0..SMALL_DOMAIN_SIZE * SMALL_WIDTH)
+                .map(|value| F::from_usize(value + 101))
+                .collect_vec(),
+            SMALL_WIDTH,
+        );
+        let (commitment, mut prover_data) =
+            <SecretHidingMerklePcs as SecretPcsCommitter<EF, Challenger>>::commit_secret(
+                &pcs,
+                vec![
+                    (large_domain, SecretProverData::new(large_matrix)),
+                    (small_domain, SecretProverData::new(small_matrix)),
+                ],
+            )
+            .expect("valid mixed-height guarded commitment must succeed");
+
+        let invalid = pcs.detach_and_open_multi_batch_secret(&[LARGE_LDE_HEIGHT], &mut prover_data);
+        assert!(matches!(
+            invalid,
+            Err(SecretFriCommitError::Dft(
+                SecretDftError::QueryIndexOutOfBounds {
+                    index: LARGE_LDE_HEIGHT,
+                    height: LARGE_LDE_HEIGHT
+                }
+            ))
+        ));
+        assert_eq!(
+            pcs.mmcs
+                .get_matrices_secret(&prover_data.commitment_data)
+                .len(),
+            2,
+            "an invalid query must not irreversibly detach valid prover data"
+        );
+
+        let indices = [0, 3, LARGE_LDE_HEIGHT - 1];
+        let baseline = pcs
+            .mmcs
+            .open_multi_batch_secret(&indices, &prover_data.commitment_data)
+            .expect("live mixed-height guarded LDEs must open");
+        let detached = pcs
+            .detach_and_open_multi_batch_secret(&indices, &mut prover_data)
+            .expect("mixed-height rows must reconstruct with MMCS index reduction");
+        assert_eq!(detached.opened_values, baseline.0);
+        assert_eq!(detached.opening_proof.0, baseline.1.0);
+        assert!(
+            pcs.mmcs
+                .get_matrices_secret(&prover_data.commitment_data)
+                .is_empty()
+        );
+
+        pcs.mmcs
+            .verify_multi_batch(
+                &commitment,
+                &[
+                    p3_matrix::Dimensions {
+                        width: LARGE_WIDTH,
+                        height: LARGE_LDE_HEIGHT,
+                    },
+                    p3_matrix::Dimensions {
+                        width: SMALL_WIDTH,
+                        height: SMALL_LDE_HEIGHT,
+                    },
+                ],
+                &indices,
+                &detached.opened_values,
+                &detached.opening_proof,
+            )
+            .expect("mixed-height detached opening must verify against the original cap");
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_pcs_commit_matches_standard_commit_and_erases_retained_lde() {
+        let pcs = make_secret_commit_pcs();
+        let domain = <SecretCommitPcs as Pcs<EF, Challenger>>::natural_domain_for_degree(&pcs, 8);
+        let matrix = RowMajorMatrix::new((1_u8..=8).map(F::from_u8).collect_vec(), 1);
+        let (expected_commitment, _standard_data) =
+            <SecretCommitPcs as Pcs<EF, Challenger>>::commit(&pcs, [(domain, matrix.clone())])
+                .expect("valid standard commitment must succeed");
+
+        let (commitment, mut prover_data) =
+            <SecretCommitPcs as SecretPcsCommitter<EF, Challenger>>::commit_secret(
+                &pcs,
+                vec![(domain, SecretProverData::new(matrix))],
+            )
+            .expect("valid guarded commitment must succeed");
+        assert_eq!(commitment, expected_commitment);
+
+        zeroize::Zeroize::zeroize(&mut prover_data);
+        let retained = pcs.mmcs.get_matrices_secret(&prover_data.commitment_data);
+        assert_eq!(retained.len(), 1);
+        assert!(retained[0].values.iter().all(|value| *value == F::ZERO));
+        assert_eq!(retained[0].width, 0);
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_pcs_commit_rejects_domain_height_mismatch() {
+        let pcs = make_secret_commit_pcs();
+        let domain = <SecretCommitPcs as Pcs<EF, Challenger>>::natural_domain_for_degree(&pcs, 8);
+        let matrix = SecretProverData::new(RowMajorMatrix::new(vec![F::ONE; 4], 1));
+
+        let result = <SecretCommitPcs as SecretPcsCommitter<EF, Challenger>>::commit_secret(
+            &pcs,
+            vec![(domain, matrix)],
+        );
+
+        assert!(matches!(
+            result,
+            Err(SecretFriCommitError::DomainHeightMismatch)
+        ));
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_quotient_commit_matches_standard_and_returns_detached() {
+        const DOMAIN_SIZE: usize = 16;
+        const NUM_CHUNKS: usize = 4;
+        const WIDTH: usize = 2;
+        const SECRET_CANARY: [u8; DOMAIN_SIZE * WIDTH] = *b"SECRET-PROVER-CANARY-0123456789!";
+
+        let pcs = make_secret_commit_pcs();
+        let domain =
+            <SecretCommitPcs as Pcs<EF, Challenger>>::natural_domain_for_degree(&pcs, DOMAIN_SIZE);
+        let values = SECRET_CANARY.into_iter().map(F::from_u8).collect_vec();
+        let matrix = RowMajorMatrix::new(values, WIDTH);
+
+        let (expected_commitment, _standard_data) = <SecretCommitPcs as UnivariateStarkPcs<
+            EF,
+            Challenger,
+        >>::commit_quotient(
+            &pcs, domain, matrix.clone(), NUM_CHUNKS
+        )
+        .expect("valid standard quotient commitment must succeed");
+
+        let (commitment, mut prover_data) = <SecretCommitPcs as
+            SecretUnivariateStarkPcsCommitter<EF, Challenger>>::commit_quotient_secret(
+            &pcs,
+            domain,
+            SecretProverData::new(matrix),
+            NUM_CHUNKS,
+        )
+        .expect("valid guarded quotient commitment must succeed");
+
+        assert_eq!(commitment, expected_commitment);
+        assert!(
+            pcs.mmcs
+                .get_matrices_secret(&prover_data.commitment_data)
+                .is_empty()
+        );
+        assert!(prover_data.authentication_data.is_some());
+        assert_eq!(
+            prover_data
+                .retained_lde_dimensions()
+                .expect("valid retained quotient geometry must remain available")
+                .len(),
+            NUM_CHUNKS
+        );
+
+        zeroize::Zeroize::zeroize(&mut prover_data);
+        let retained = pcs.mmcs.get_matrices_secret(&prover_data.commitment_data);
+        assert!(retained.is_empty());
+        assert!(prover_data.coefficients.is_empty());
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_quotient_batch_matches_one_standard_global_commitment() {
+        const FIRST_SIZE: usize = 16;
+        const FIRST_CHUNKS: usize = 4;
+        const SECOND_SIZE: usize = 8;
+        const SECOND_CHUNKS: usize = 2;
+
+        let pcs = make_secret_commit_pcs();
+        let first_domain =
+            <SecretCommitPcs as Pcs<EF, Challenger>>::natural_domain_for_degree(&pcs, FIRST_SIZE);
+        let second_domain =
+            <SecretCommitPcs as Pcs<EF, Challenger>>::natural_domain_for_degree(&pcs, SECOND_SIZE);
+        let first = RowMajorMatrix::new((0..FIRST_SIZE).map(F::from_usize).collect_vec(), 1);
+        let second = RowMajorMatrix::new(
+            (FIRST_SIZE..FIRST_SIZE + SECOND_SIZE * 2)
+                .map(F::from_usize)
+                .collect_vec(),
+            2,
+        );
+
+        let mut ordinary_ldes = Vec::new();
+        for (domain, matrix, num_chunks) in [
+            (first_domain, first.clone(), FIRST_CHUNKS),
+            (second_domain, second.clone(), SECOND_CHUNKS),
+        ] {
+            let chunk_domains = domain.split_domains(num_chunks);
+            let chunk_matrices = domain.split_evals(num_chunks, matrix);
+            let chunk_ldes =
+                <SecretCommitPcs as UnivariateStarkPcs<EF, Challenger>>::get_quotient_ldes(
+                    &pcs,
+                    chunk_domains.into_iter().zip(chunk_matrices),
+                    num_chunks,
+                )
+                .expect("valid ordinary quotient LDE construction must succeed");
+            ordinary_ldes.extend(chunk_ldes);
+        }
+        let (expected_commitment, _ordinary_data) = <SecretCommitPcs as UnivariateStarkPcs<
+            EF,
+            Challenger,
+        >>::commit_ldes(&pcs, ordinary_ldes)
+        .expect("valid ordinary global quotient commitment must succeed");
+
+        let (generated_commitment, mut generated_data) = <SecretCommitPcs as
+            SecretUnivariateStarkPcsCommitter<EF, Challenger>>::commit_generated_quotients_secret(
+            &pcs,
+            vec![
+                SecretQuotientCommitmentPlan::new(first_domain, 1, FIRST_CHUNKS),
+                SecretQuotientCommitmentPlan::new(second_domain, 2, SECOND_CHUNKS),
+            ],
+            |index, _| {
+                let matrix = if index == 0 {
+                    first.clone()
+                } else {
+                    second.clone()
+                };
+                Ok::<_, SecretMatrixError>(SecretProverData::new(matrix))
+            },
+        )
+        .expect("valid generated quotient batch must succeed");
+        assert_eq!(generated_commitment, expected_commitment);
+        zeroize::Zeroize::zeroize(&mut generated_data);
+
+        let (commitment, mut prover_data) = <SecretCommitPcs as
+            SecretUnivariateStarkPcsCommitter<EF, Challenger>>::commit_quotients_secret(
+            &pcs,
+            vec![
+                SecretQuotientCommitmentInput::new(
+                    first_domain,
+                    SecretProverData::new(first),
+                    FIRST_CHUNKS,
+                ),
+                SecretQuotientCommitmentInput::new(
+                    second_domain,
+                    SecretProverData::new(second),
+                    SECOND_CHUNKS,
+                ),
+            ],
+        )
+        .expect("valid guarded quotient batch must succeed");
+
+        assert_eq!(commitment, expected_commitment);
+        assert!(
+            pcs.mmcs
+                .get_matrices_secret(&prover_data.commitment_data)
+                .is_empty()
+        );
+        assert!(prover_data.authentication_data.is_some());
+        assert_eq!(
+            prover_data
+                .retained_lde_dimensions()
+                .expect("valid retained quotient geometry must remain available")
+                .len(),
+            FIRST_CHUNKS + SECOND_CHUNKS
+        );
+        zeroize::Zeroize::zeroize(&mut prover_data);
+        let retained = pcs.mmcs.get_matrices_secret(&prover_data.commitment_data);
+        assert!(retained.is_empty());
+        assert!(prover_data.coefficients.is_empty());
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_quotient_batch_rejects_empty_input() {
+        let pcs = make_secret_commit_pcs();
+        let result = <SecretCommitPcs as SecretUnivariateStarkPcsCommitter<
+            EF,
+            Challenger,
+        >>::commit_quotients_secret(&pcs, Vec::new());
+
+        assert!(matches!(
+            result,
+            Err(SecretFriCommitError::EmptyQuotientBatch)
+        ));
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn generated_quotient_batch_rejects_complete_plan_before_generation() {
+        const DOMAIN_SIZE: usize = 16;
+
+        let pcs = make_secret_commit_pcs();
+        let domain =
+            <SecretCommitPcs as Pcs<EF, Challenger>>::natural_domain_for_degree(&pcs, DOMAIN_SIZE);
+        let mut generation_calls = 0_usize;
+        let result = <SecretCommitPcs as SecretUnivariateStarkPcsCommitter<EF, Challenger>>::commit_generated_quotients_secret(
+            &pcs,
+            vec![
+                SecretQuotientCommitmentPlan::new(domain, 1, 2),
+                SecretQuotientCommitmentPlan::new(domain, 1, 3),
+            ],
+            |_, _| {
+                generation_calls += 1;
+                Ok::<_, SecretMatrixError>(SecretProverData::new(RowMajorMatrix::new(
+                    vec![F::ONE; DOMAIN_SIZE],
+                    1,
+                )))
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(SecretGeneratedQuotientCommitError::Commitment(
+                SecretFriCommitError::InvalidQuotientChunkCount
+            ))
+        ));
+        assert_eq!(generation_calls, 0);
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_quotient_commit_rejects_invalid_chunk_counts() {
+        const DOMAIN_SIZE: usize = 16;
+
+        let pcs = make_secret_commit_pcs();
+        let domain =
+            <SecretCommitPcs as Pcs<EF, Challenger>>::natural_domain_for_degree(&pcs, DOMAIN_SIZE);
+
+        for num_chunks in [0, 3, DOMAIN_SIZE * 2] {
+            let matrix = SecretProverData::new(RowMajorMatrix::new(vec![F::ONE; DOMAIN_SIZE], 1));
+            let result = <SecretCommitPcs as
+                SecretUnivariateStarkPcsCommitter<EF, Challenger>>::commit_quotient_secret(
+                &pcs,
+                domain,
+                matrix,
+                num_chunks,
+            );
+
+            assert!(matches!(
+                result,
+                Err(SecretFriCommitError::InvalidQuotientChunkCount)
+            ));
+        }
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_commitment_paths_reject_zero_width_without_panicking() {
+        const DOMAIN_SIZE: usize = 8;
+
+        let pcs = make_secret_commit_pcs();
+        let domain =
+            <SecretCommitPcs as Pcs<EF, Challenger>>::natural_domain_for_degree(&pcs, DOMAIN_SIZE);
+        let mut malformed = RowMajorMatrix::new(vec![F::ONE; DOMAIN_SIZE], 1);
+        malformed.width = 0;
+
+        let commit_result = <SecretCommitPcs as SecretPcsCommitter<EF, Challenger>>::commit_secret(
+            &pcs,
+            vec![(domain, SecretProverData::new(malformed))],
+        );
+        assert!(matches!(
+            commit_result,
+            Err(SecretFriCommitError::Matrix(
+                SecretMatrixError::InvalidShape
+            ))
+        ));
+
+        let mut malformed = RowMajorMatrix::new(vec![F::ONE; DOMAIN_SIZE], 1);
+        malformed.width = 0;
+        let quotient_result = <SecretCommitPcs as SecretUnivariateStarkPcsCommitter<
+            EF,
+            Challenger,
+        >>::commit_quotient_secret(
+            &pcs, domain, SecretProverData::new(malformed), 2
+        );
+        assert!(matches!(
+            quotient_result,
+            Err(SecretFriCommitError::Matrix(
+                SecretMatrixError::InvalidShape
+            ))
+        ));
     }
 
     /// Grinding difficulty the roundtrip fixture proves at.
@@ -1454,6 +4697,43 @@ mod tests {
         challenger: &mut Challenger,
     ) -> Result<(), TestError> {
         <MyPcs as Pcs<EF, Challenger>>::verify(pcs, claims, proof, challenger)
+    }
+
+    #[test]
+    fn empty_opening_batch_is_a_typed_error_and_preserves_challenger() {
+        let (pcs, _, _, mut challenger) = make_pcs_fixture();
+        let mut before = challenger.clone();
+
+        let result = pcs.open(Vec::new(), &mut challenger);
+
+        assert!(matches!(result, Err(FriProverError::EmptyOpeningBatch)));
+        assert_eq!(
+            challenger.sample_algebra_element::<EF>(),
+            before.sample_algebra_element::<EF>()
+        );
+    }
+
+    #[test]
+    fn opening_request_shape_mismatch_is_a_typed_error_and_preserves_challenger() {
+        let (pcs, _, _, mut challenger) = make_pcs_fixture();
+        let domain = <MyPcs as Pcs<EF, Challenger>>::natural_domain_for_degree(&pcs, 8);
+        let (_, prover_data) = <MyPcs as Pcs<EF, Challenger>>::commit(
+            &pcs,
+            [(domain, RowMajorMatrix::new(vec![F::ONE; 8], 1))],
+        )
+        .expect("valid test commitment must succeed");
+        let mut before = challenger.clone();
+
+        let result = pcs.open(vec![(&prover_data, Vec::new()).into()], &mut challenger);
+
+        assert!(matches!(
+            result,
+            Err(FriProverError::OpeningRequestShapeMismatch)
+        ));
+        assert_eq!(
+            challenger.sample_algebra_element::<EF>(),
+            before.sample_algebra_element::<EF>()
+        );
     }
 
     #[test]
@@ -1827,6 +5107,63 @@ mod tests {
         check::<F, EF>();
         check::<F, F>();
         check::<Goldilocks, BinomialExtensionField<Goldilocks, 2>>();
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_fold_matches_ordinary_at_every_supported_test_arity_and_erases() {
+        let mut rng = SmallRng::seed_from_u64(0x4652_492d_464f_4c44);
+        let folding = TwoAdicFriFolding::<(), ()>(PhantomData);
+
+        for log_arity in 1..=4 {
+            let beta: EF = rng.random();
+            let matrix = RowMajorMatrix::<EF>::rand(&mut rng, 32, 1 << log_arity);
+            let expected = FriFoldingStrategy::<F, EF>::fold_matrix(
+                &folding,
+                beta,
+                log_arity,
+                matrix.as_view(),
+            );
+            let mut guarded = SecretFriFoldingStrategy::<F, EF>::fold_matrix_secret(
+                &folding,
+                beta,
+                log_arity,
+                matrix.as_view(),
+            )
+            .expect("valid guarded fold must succeed");
+
+            assert_eq!(guarded.width, 1);
+            assert_eq!(guarded.values, expected);
+            zeroize::Zeroize::zeroize(&mut guarded);
+            assert_eq!(guarded.width, 0);
+            assert!(guarded.values.iter().all(|value| *value == EF::ZERO));
+        }
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_fold_rejects_invalid_shapes_without_panicking() {
+        let folding = TwoAdicFriFolding::<(), ()>(PhantomData);
+        let matrix = RowMajorMatrix::new(vec![EF::ONE; 8], 2);
+
+        let zero_arity = SecretFriFoldingStrategy::<F, EF>::fold_matrix_secret(
+            &folding,
+            EF::TWO,
+            0,
+            matrix.as_view(),
+        );
+        assert!(matches!(zero_arity, Err(SecretFriFoldError::ZeroLogArity)));
+
+        let wrong_width = SecretFriFoldingStrategy::<F, EF>::fold_matrix_secret(
+            &folding,
+            EF::TWO,
+            2,
+            matrix.as_view(),
+        );
+        assert!(matches!(
+            wrong_width,
+            Err(SecretFriFoldError::InvalidMatrixShape)
+        ));
     }
 
     /// Check that `fold` folds each row of random matrices exactly as `fold_row` folds that

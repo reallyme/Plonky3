@@ -1,3 +1,7 @@
+# Modified by ReallyMe Technologies Limited, 2026.
+# SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "p3-fri"
 description = "An implementation of the FRI low-degree test (LDT) protocol used in zero-knowledge proof systems."
@@ -11,6 +15,13 @@ categories.workspace = true
 
 [features]
 parallel = ["p3-maybe-rayon/parallel"]
+secret-memory = [
+    "dep:zeroize",
+    "p3-commit/secret-memory",
+    "p3-dft/secret-memory",
+    "p3-field/secret-memory",
+    "p3-matrix/secret-memory",
+]
 
 [dependencies]
 p3-challenger.workspace = true
@@ -28,16 +39,17 @@ serde = { workspace = true, features = ["derive", "alloc"] }
 spin.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
-p3-baby-bear = { path = "../baby-bear" }
+p3-baby-bear = { path = "../baby-bear", features = ["secret-memory"] }
 p3-challenger = { path = "../challenger", features = ["test-utils"] }
 p3-circle = { path = "../circle" }
 p3-commit = { path = "../commit", features = ["test-utils"] }
-p3-dft = { path = "../dft" }
+p3-dft = { path = "../dft", features = ["secret-memory"] }
 p3-goldilocks = { path = "../goldilocks" }
 p3-keccak = { path = "../keccak" }
-p3-merkle-tree = { path = "../merkle-tree" }
+p3-merkle-tree = { path = "../merkle-tree", features = ["secret-memory"] }
 p3-mersenne-31 = { path = "../mersenne-31" }
 p3-symmetric = { path = "../symmetric" }
 

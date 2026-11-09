@@ -1,3 +1,7 @@
+<!-- Modified by ReallyMe Technologies Limited, 2026. -->
+<!-- SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited -->
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+
 # Changelog
 
 All notable changes to this project will be documented in this file.
@@ -6,6 +10,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- Add guarded random matrix allocation that establishes zeroizing ownership before the first
+  random value is written and rejects empty or overflowing shapes with typed errors.
+- Add opt-in zeroizing matrix owners, checked guarded random-column widening, guarded
+  zero-filled row growth, guarded extension-column flattening, and transitive erasure for
+  extension-field flattening views.
+- Add guarded precomputed coset interpolation. Partial witness-derived column sums remain under
+  zeroizing ownership until only the completed, protocol-disclosed evaluations are copied out.
+- Add guarded column truncation that erases discarded columns and the superseded allocation before
+  replacing the owner.
+- Add checked guarded matrix duplication for protocols that must retain source evaluations while a
+  consuming prover stage transforms an independently erased copy.
+- Add consuming fixed-stride row selection for interleaved protocol layouts. Selected rows move
+  into a new zeroizing owner and omitted rows are erased with the superseded allocation.
+
 ## [0.8.0] - 2026-09-23
 ### Merged PRs
 - Chore: expose the parallel feature on every crate that uses rayon (#2049)
@@ -78,4 +97,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Authors
 - AngusG
 - Thomas Coratger
-

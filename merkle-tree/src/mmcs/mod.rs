@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! A MerkleTreeMmcs is a generalization of the standard MerkleTree commitment scheme which supports
 //! committing to several matrices of different dimensions, with arbitrary arity N (binary by default).
 //!
@@ -36,12 +40,14 @@ use p3_symmetric::{CryptographicHasher, MerkleCap, PseudoCompressionFunction};
 use p3_util::log2_ceil_usize;
 use serde::{Deserialize, Serialize};
 
-use crate::MerkleTree;
 use crate::MerkleTreeError::{
     CapMismatch, IndexOutOfBounds, WrongBatchSize, WrongCapSize, WrongHeight,
 };
 use crate::merkle_tree::{padded_len, select_arity_step};
-use crate::pruning::{MerkleAuthPath, PrunedMerklePaths, restore_paths, walk_frontier};
+use crate::pruning::{
+    MerkleAuthPath, PrunedMerklePaths, prune_paths, restore_paths, walk_frontier,
+};
+use crate::{MerkleTree, MerkleTreeAuthenticationData};
 
 mod batch;
 mod error;
@@ -50,7 +56,7 @@ mod pruned;
 mod verify;
 
 pub use error::{MerkleTreeError, PrunedProofError};
-pub(crate) use geometry::{check_widths, validate_commit_reachable_heights};
+pub(crate) use geometry::{check_widths, derive_arity_schedule, validate_commit_reachable_heights};
 pub use pruned::PrunedBatchOpening;
 
 /// Materialize a row whose width is known even when its iterator has no size hint.
@@ -162,6 +168,431 @@ impl<P, PW, H, C, const N: usize, const DIGEST_ELEMS: usize>
         self.cap_height
     }
 
+    #[cfg(feature = "secret-memory")]
+    pub(crate) const fn hash(&self) -> &H {
+        &self.hash
+    }
+
+    #[cfg(feature = "secret-memory")]
+    pub(crate) const fn compress(&self) -> &C {
+        &self.compress
+    }
+
+    /// Open one query using matrices recomputed after the original committed
+    /// matrices were erased.
+    ///
+    /// Every matrix must exactly match its committed width and height. The
+    /// authentication path is read from `authentication_data`, so the resulting
+    /// opening has the same wire format as [`Mmcs::open_batch`].
+    pub fn open_batch_with_recomputed_matrices<M: Matrix<P::Value>>(
+        &self,
+        index: usize,
+        matrices: &[M],
+        authentication_data: &MerkleTreeAuthenticationData<P::Value, PW::Value, N, DIGEST_ELEMS>,
+    ) -> Result<p3_commit::BatchOpening<P::Value, Self>, MerkleTreeError>
+    where
+        P: PackedValue,
+        PW: PackedValue,
+        H: CryptographicHasher<P::Value, [PW::Value; DIGEST_ELEMS]>
+            + CryptographicHasher<P, [PW; DIGEST_ELEMS]>
+            + Sync,
+        C: PseudoCompressionFunction<[PW::Value; DIGEST_ELEMS], N>
+            + PseudoCompressionFunction<[PW; DIGEST_ELEMS], N>
+            + Sync,
+        PW::Value: Eq + Clone,
+        [PW::Value; DIGEST_ELEMS]: Serialize + for<'de> Deserialize<'de>,
+    {
+        let (max_height, log_max_height, proof_levels, expected_siblings) =
+            self.validate_recomputed_opening(matrices, authentication_data, &[index])?;
+        let openings = Self::collect_recomputed_rows(
+            index,
+            matrices,
+            &authentication_data.dimensions,
+            log_max_height,
+        )?;
+        let proof = Self::authentication_path(
+            index,
+            max_height,
+            proof_levels,
+            expected_siblings,
+            authentication_data,
+        )?;
+        Ok(p3_commit::BatchOpening::new(openings, proof.siblings))
+    }
+
+    /// Open several queries with one pruned authentication proof using matrices
+    /// recomputed after the original committed matrices were erased.
+    pub fn open_batch_pruned_with_recomputed_matrices<M: Matrix<P::Value>>(
+        &self,
+        indices: &[usize],
+        matrices: &[M],
+        authentication_data: &MerkleTreeAuthenticationData<P::Value, PW::Value, N, DIGEST_ELEMS>,
+    ) -> Result<PrunedBatchOpening<P::Value, PW::Value, DIGEST_ELEMS>, MerkleTreeError>
+    where
+        P: PackedValue,
+        PW: PackedValue,
+        H: CryptographicHasher<P::Value, [PW::Value; DIGEST_ELEMS]>
+            + CryptographicHasher<P, [PW; DIGEST_ELEMS]>
+            + Sync,
+        C: PseudoCompressionFunction<[PW::Value; DIGEST_ELEMS], N>
+            + PseudoCompressionFunction<[PW; DIGEST_ELEMS], N>
+            + Sync,
+        PW::Value: Eq + Clone,
+        [PW::Value; DIGEST_ELEMS]: Serialize + for<'de> Deserialize<'de>,
+    {
+        let (max_height, log_max_height, proof_levels, expected_siblings) =
+            self.validate_recomputed_opening(matrices, authentication_data, indices)?;
+
+        let mut opened_values = Vec::new();
+        opened_values
+            .try_reserve_exact(indices.len())
+            .map_err(|_| MerkleTreeError::RecomputedOpeningAllocationFailed)?;
+        let mut authentication_paths = Vec::new();
+        authentication_paths
+            .try_reserve_exact(indices.len())
+            .map_err(|_| MerkleTreeError::RecomputedOpeningAllocationFailed)?;
+        for &index in indices {
+            opened_values.push(Self::collect_recomputed_rows(
+                index,
+                matrices,
+                &authentication_data.dimensions,
+                log_max_height,
+            )?);
+            authentication_paths.push(Self::authentication_path(
+                index,
+                max_height,
+                proof_levels,
+                expected_siblings,
+                authentication_data,
+            )?);
+        }
+
+        let pruned_proof = prune_paths(
+            authentication_data
+                .arity_schedule
+                .get(..proof_levels)
+                .ok_or(MerkleTreeError::MalformedAuthenticationData)?,
+            &authentication_paths,
+        );
+        Ok(PrunedBatchOpening {
+            opened_values,
+            pruned_proof,
+        })
+    }
+
+    /// Authenticate one already-recomputed row from every committed matrix.
+    ///
+    /// This is the streaming counterpart of
+    /// [`Self::open_batch_with_recomputed_matrices`]: callers that can evaluate
+    /// only the queried rows do not need to recreate full matrices.
+    pub fn open_batch_with_recomputed_rows<Row: AsRef<[P::Value]>>(
+        &self,
+        index: usize,
+        opened_rows: &[Row],
+        authentication_data: &MerkleTreeAuthenticationData<P::Value, PW::Value, N, DIGEST_ELEMS>,
+    ) -> Result<p3_commit::BatchOpening<P::Value, Self>, MerkleTreeError>
+    where
+        P: PackedValue,
+        PW: PackedValue,
+        H: CryptographicHasher<P::Value, [PW::Value; DIGEST_ELEMS]>
+            + CryptographicHasher<P, [PW; DIGEST_ELEMS]>
+            + Sync,
+        C: PseudoCompressionFunction<[PW::Value; DIGEST_ELEMS], N>
+            + PseudoCompressionFunction<[PW; DIGEST_ELEMS], N>
+            + Sync,
+        PW::Value: Eq + Clone,
+        [PW::Value; DIGEST_ELEMS]: Serialize + for<'de> Deserialize<'de>,
+    {
+        let (max_height, _, proof_levels, expected_siblings) =
+            self.validate_authentication_opening(authentication_data, &[index])?;
+        check_widths(&authentication_data.dimensions, opened_rows)?;
+        let openings = Self::copy_opened_rows(opened_rows)?;
+        let proof = Self::authentication_path(
+            index,
+            max_height,
+            proof_levels,
+            expected_siblings,
+            authentication_data,
+        )?;
+        Ok(p3_commit::BatchOpening::new(openings, proof.siblings))
+    }
+
+    /// Authenticate multiple sets of already-recomputed rows with one pruned proof.
+    pub fn open_batch_pruned_with_recomputed_rows<Row: AsRef<[P::Value]>>(
+        &self,
+        indices: &[usize],
+        opened_rows: &[Vec<Row>],
+        authentication_data: &MerkleTreeAuthenticationData<P::Value, PW::Value, N, DIGEST_ELEMS>,
+    ) -> Result<PrunedBatchOpening<P::Value, PW::Value, DIGEST_ELEMS>, MerkleTreeError>
+    where
+        P: PackedValue,
+        PW: PackedValue,
+        H: CryptographicHasher<P::Value, [PW::Value; DIGEST_ELEMS]>
+            + CryptographicHasher<P, [PW; DIGEST_ELEMS]>
+            + Sync,
+        C: PseudoCompressionFunction<[PW::Value; DIGEST_ELEMS], N>
+            + PseudoCompressionFunction<[PW; DIGEST_ELEMS], N>
+            + Sync,
+        PW::Value: Eq + Clone,
+        [PW::Value; DIGEST_ELEMS]: Serialize + for<'de> Deserialize<'de>,
+    {
+        if opened_rows.len() != indices.len() {
+            return Err(WrongBatchSize {
+                expected: indices.len(),
+                got: opened_rows.len(),
+            });
+        }
+        let (max_height, _, proof_levels, expected_siblings) =
+            self.validate_authentication_opening(authentication_data, indices)?;
+
+        let mut copied_rows = Vec::new();
+        copied_rows
+            .try_reserve_exact(indices.len())
+            .map_err(|_| MerkleTreeError::RecomputedOpeningAllocationFailed)?;
+        let mut authentication_paths = Vec::new();
+        authentication_paths
+            .try_reserve_exact(indices.len())
+            .map_err(|_| MerkleTreeError::RecomputedOpeningAllocationFailed)?;
+        for (&index, rows) in indices.iter().zip(opened_rows) {
+            check_widths(&authentication_data.dimensions, rows)?;
+            copied_rows.push(Self::copy_opened_rows(rows)?);
+            authentication_paths.push(Self::authentication_path(
+                index,
+                max_height,
+                proof_levels,
+                expected_siblings,
+                authentication_data,
+            )?);
+        }
+
+        let pruned_proof = prune_paths(
+            authentication_data
+                .arity_schedule
+                .get(..proof_levels)
+                .ok_or(MerkleTreeError::MalformedAuthenticationData)?,
+            &authentication_paths,
+        );
+        Ok(PrunedBatchOpening {
+            opened_values: copied_rows,
+            pruned_proof,
+        })
+    }
+
+    fn validate_recomputed_opening<M: Matrix<P::Value>>(
+        &self,
+        matrices: &[M],
+        authentication_data: &MerkleTreeAuthenticationData<P::Value, PW::Value, N, DIGEST_ELEMS>,
+        indices: &[usize],
+    ) -> Result<(usize, usize, usize, usize), MerkleTreeError>
+    where
+        P: PackedValue,
+        PW: PackedValue,
+    {
+        if matrices.len() != authentication_data.dimensions.len() {
+            return Err(WrongBatchSize {
+                expected: authentication_data.dimensions.len(),
+                got: matrices.len(),
+            });
+        }
+        for (matrix_index, (matrix, committed)) in matrices
+            .iter()
+            .zip(&authentication_data.dimensions)
+            .enumerate()
+        {
+            let recomputed = matrix.dimensions();
+            if recomputed != *committed {
+                return Err(MerkleTreeError::RecomputedMatrixShapeMismatch {
+                    matrix: matrix_index,
+                    expected_width: committed.width,
+                    expected_height: committed.height,
+                    got_width: recomputed.width,
+                    got_height: recomputed.height,
+                });
+            }
+        }
+
+        self.validate_authentication_opening(authentication_data, indices)
+    }
+
+    fn validate_authentication_opening(
+        &self,
+        authentication_data: &MerkleTreeAuthenticationData<P::Value, PW::Value, N, DIGEST_ELEMS>,
+        indices: &[usize],
+    ) -> Result<(usize, usize, usize, usize), MerkleTreeError>
+    where
+        P: PackedValue,
+        PW: PackedValue,
+    {
+        let max_height = validate_commit_reachable_heights(
+            authentication_data
+                .dimensions
+                .iter()
+                .map(|dimensions| dimensions.height),
+        )?;
+        if let Some(&index) = indices.iter().find(|&&index| index >= max_height) {
+            return Err(IndexOutOfBounds { max_height, index });
+        }
+
+        let num_layers = authentication_data.digest_layers.len();
+        if num_layers == 0 {
+            return Err(MerkleTreeError::MalformedAuthenticationData);
+        }
+        let expected_schedule_len = num_layers
+            .checked_sub(1)
+            .ok_or(MerkleTreeError::MalformedAuthenticationData)?;
+        if authentication_data.arity_schedule.len() != expected_schedule_len {
+            return Err(MerkleTreeError::MalformedAuthenticationData);
+        }
+        let effective_cap_height = self.cap_height.min(num_layers.saturating_sub(1));
+        let proof_levels = num_layers
+            .checked_sub(1)
+            .and_then(|levels| levels.checked_sub(effective_cap_height))
+            .ok_or(MerkleTreeError::MalformedAuthenticationData)?;
+        let schedule = authentication_data
+            .arity_schedule
+            .get(..proof_levels)
+            .ok_or(MerkleTreeError::MalformedAuthenticationData)?;
+        let expected_siblings = schedule.iter().try_fold(0usize, |total, &step| {
+            step.checked_sub(1)
+                .and_then(|siblings| total.checked_add(siblings))
+        });
+        let expected_siblings =
+            expected_siblings.ok_or(MerkleTreeError::MalformedAuthenticationData)?;
+
+        Ok((
+            max_height,
+            log2_ceil_usize(max_height),
+            proof_levels,
+            expected_siblings,
+        ))
+    }
+
+    fn copy_opened_rows<Row: AsRef<[P::Value]>>(
+        rows: &[Row],
+    ) -> Result<Vec<Vec<P::Value>>, MerkleTreeError>
+    where
+        P: PackedValue,
+    {
+        let mut copied = Vec::new();
+        copied
+            .try_reserve_exact(rows.len())
+            .map_err(|_| MerkleTreeError::RecomputedOpeningAllocationFailed)?;
+        for row in rows {
+            let source = row.as_ref();
+            let mut destination = Vec::new();
+            destination
+                .try_reserve_exact(source.len())
+                .map_err(|_| MerkleTreeError::RecomputedOpeningAllocationFailed)?;
+            destination.extend_from_slice(source);
+            copied.push(destination);
+        }
+        Ok(copied)
+    }
+
+    fn collect_recomputed_rows<M: Matrix<P::Value>>(
+        index: usize,
+        matrices: &[M],
+        dimensions: &[Dimensions],
+        log_max_height: usize,
+    ) -> Result<Vec<Vec<P::Value>>, MerkleTreeError>
+    where
+        P: PackedValue,
+    {
+        let mut openings = Vec::new();
+        openings
+            .try_reserve_exact(matrices.len())
+            .map_err(|_| MerkleTreeError::RecomputedOpeningAllocationFailed)?;
+        for (matrix_index, (matrix, committed)) in matrices.iter().zip(dimensions).enumerate() {
+            let log_height = log2_ceil_usize(committed.height);
+            let bits_reduced = log_max_height
+                .checked_sub(log_height)
+                .ok_or(MerkleTreeError::MalformedAuthenticationData)?;
+            let row_index = index >> bits_reduced;
+            let row = matrix
+                .row(row_index)
+                .ok_or(MerkleTreeError::RecomputedRowUnavailable {
+                    matrix: matrix_index,
+                    row: row_index,
+                })?;
+            let maximum_observed_width = committed
+                .width
+                .checked_add(1)
+                .ok_or(MerkleTreeError::MalformedAuthenticationData)?;
+            let mut opened_row = Vec::new();
+            opened_row
+                .try_reserve_exact(maximum_observed_width)
+                .map_err(|_| MerkleTreeError::RecomputedOpeningAllocationFailed)?;
+            opened_row.extend(row.into_iter().take(maximum_observed_width));
+            if opened_row.len() != committed.width {
+                return Err(MerkleTreeError::WrongWidth {
+                    matrix: matrix_index,
+                    expected: committed.width,
+                    got: opened_row.len(),
+                });
+            }
+            openings.push(opened_row);
+        }
+        Ok(openings)
+    }
+
+    fn authentication_path(
+        index: usize,
+        max_height: usize,
+        proof_levels: usize,
+        expected_siblings: usize,
+        authentication_data: &MerkleTreeAuthenticationData<P::Value, PW::Value, N, DIGEST_ELEMS>,
+    ) -> Result<MerkleAuthPath<PW::Value, DIGEST_ELEMS>, MerkleTreeError>
+    where
+        P: PackedValue,
+        PW: PackedValue,
+    {
+        if index >= max_height {
+            return Err(IndexOutOfBounds { max_height, index });
+        }
+        let mut siblings = Vec::new();
+        siblings
+            .try_reserve_exact(expected_siblings)
+            .map_err(|_| MerkleTreeError::RecomputedOpeningAllocationFailed)?;
+        let mut current_index = index;
+        for layer_index in 0..proof_levels {
+            let step = *authentication_data
+                .arity_schedule
+                .get(layer_index)
+                .ok_or(MerkleTreeError::MalformedAuthenticationData)?;
+            if step != 2 && step != N {
+                return Err(MerkleTreeError::MalformedAuthenticationData);
+            }
+            let group_start = current_index
+                .checked_div(step)
+                .and_then(|group| group.checked_mul(step))
+                .ok_or(MerkleTreeError::MalformedAuthenticationData)?;
+            let position = current_index % step;
+            let layer = authentication_data
+                .digest_layers
+                .get(layer_index)
+                .ok_or(MerkleTreeError::MalformedAuthenticationData)?;
+            for child in 0..step {
+                if child != position {
+                    let sibling_index = group_start
+                        .checked_add(child)
+                        .ok_or(MerkleTreeError::MalformedAuthenticationData)?;
+                    let sibling = layer
+                        .get(sibling_index)
+                        .ok_or(MerkleTreeError::MalformedAuthenticationData)?;
+                    siblings.push(*sibling);
+                }
+            }
+            current_index /= step;
+        }
+        if siblings.len() != expected_siblings {
+            return Err(MerkleTreeError::MalformedAuthenticationData);
+        }
+        Ok(MerkleAuthPath {
+            leaf_index: index,
+            siblings,
+        })
+    }
+
     // Verifier-side arity geometry, derived without hashing.
 
     /// Replay the arity schedule for a given Merkle path and recover, for each
@@ -242,6 +673,28 @@ impl<P, PW, H, C, const N: usize, const DIGEST_ELEMS: usize>
         let (mut schedule, proof_levels) = self.arity_schedule_and_proof_levels(dimensions)?;
         schedule.truncate(proof_levels);
         Ok(schedule)
+    }
+
+    /// Resolve the configured cap against mixed-height injection boundaries.
+    ///
+    /// A detached builder has no retained matrices from which to call the
+    /// ordinary cap helper. Deriving the boundary from public dimensions keeps
+    /// its commitment identical to [`Mmcs::commit`] without retaining witness
+    /// storage.
+    #[cfg(feature = "secret-memory")]
+    pub(crate) fn effective_cap_height_for_dimensions(
+        &self,
+        dimensions: &[Dimensions],
+    ) -> Result<usize, MerkleTreeError>
+    where
+        P: PackedValue,
+        PW: PackedValue,
+    {
+        let (schedule, proof_levels) = self.arity_schedule_and_proof_levels(dimensions)?;
+        schedule
+            .len()
+            .checked_sub(proof_levels)
+            .ok_or(MerkleTreeError::TreeGeometryOverflow)
     }
 
     /// Reject a commitment that does not hold exactly the roots the tree's top layers produce.

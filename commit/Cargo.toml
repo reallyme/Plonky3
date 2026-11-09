@@ -1,3 +1,7 @@
+# Modified by ReallyMe Technologies Limited, 2026.
+# SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "p3-commit"
 description = "A framework for implementing various cryptographic commitment schemes, including non-hiding variants."
@@ -12,6 +16,7 @@ categories.workspace = true
 [features]
 default = []
 parallel = ["p3-maybe-rayon/parallel"]
+secret-memory = ["dep:zeroize", "p3-matrix/secret-memory"]
 test-utils = ["p3-challenger"]
 
 [dependencies]
@@ -25,6 +30,7 @@ itertools.workspace = true
 # The opening types derive their codecs, and they hold `Vec`s.
 serde = { workspace = true, features = ["derive", "alloc"] }
 thiserror.workspace = true
+zeroize = { workspace = true, optional = true }
 
 # for testing
 p3-challenger = { workspace = true, optional = true }

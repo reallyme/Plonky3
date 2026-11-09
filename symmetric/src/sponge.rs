@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Sponge-based hash functions built from cryptographic permutations.
 //!
 //! # Background
@@ -99,6 +103,8 @@ use p3_field::{
 };
 use thiserror::Error;
 
+#[cfg(feature = "secret-memory")]
+use crate::IncrementalCryptographicHasher;
 use crate::Permutation;
 use crate::hasher::CryptographicHasher;
 use crate::permutation::{CryptographicPermutation, Derangement};
@@ -228,6 +234,70 @@ where
 
         // Squeeze: return the first OUT elements of the final state.
         state[..OUT].try_into().unwrap()
+    }
+}
+
+/// Zeroizing state for chunked fixed-length padding-free sponge hashing.
+#[cfg(feature = "secret-memory")]
+pub struct PaddingFreeSpongeState<T, const WIDTH: usize> {
+    state: [T; WIDTH],
+    next_rate_index: usize,
+}
+
+#[cfg(feature = "secret-memory")]
+impl<T, const WIDTH: usize> zeroize::Zeroize for PaddingFreeSpongeState<T, WIDTH>
+where
+    T: zeroize::Zeroize,
+{
+    fn zeroize(&mut self) {
+        self.state.zeroize();
+        self.next_rate_index.zeroize();
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<T, const WIDTH: usize> zeroize::ZeroizeOnDrop for PaddingFreeSpongeState<T, WIDTH> where
+    T: zeroize::Zeroize
+{
+}
+
+#[cfg(feature = "secret-memory")]
+impl<T, P, const WIDTH: usize, const RATE: usize, const OUT: usize>
+    IncrementalCryptographicHasher<T, [T; OUT]> for PaddingFreeSponge<P, WIDTH, RATE, OUT>
+where
+    T: Default + Copy + zeroize::Zeroize,
+    P: CryptographicPermutation<[T; WIDTH]>,
+{
+    type State = PaddingFreeSpongeState<T, WIDTH>;
+
+    fn begin_hash(&self) -> Self::State {
+        PaddingFreeSpongeState {
+            state: [T::default(); WIDTH],
+            next_rate_index: 0,
+        }
+    }
+
+    fn absorb<I>(&self, state: &mut Self::State, input: I)
+    where
+        I: IntoIterator<Item = T>,
+    {
+        for value in input {
+            state.state[state.next_rate_index] = value;
+            let next_rate_index = state.next_rate_index.checked_add(1).unwrap_or(RATE);
+            if next_rate_index == RATE {
+                self.permutation.permute_mut(&mut state.state);
+                state.next_rate_index = 0;
+            } else {
+                state.next_rate_index = next_rate_index;
+            }
+        }
+    }
+
+    fn finalize_hash(&self, mut state: Self::State) -> [T; OUT] {
+        if state.next_rate_index != 0 {
+            self.permutation.permute_mut(&mut state.state);
+        }
+        core::array::from_fn(|index| state.state[index])
     }
 }
 
@@ -705,6 +775,8 @@ where
 mod tests {
     use alloc::format;
     use alloc::string::ToString;
+    #[cfg(feature = "secret-memory")]
+    use alloc::vec::Vec;
     use core::any::type_name;
 
     use p3_field::PrimeCharacteristicRing;
@@ -919,6 +991,27 @@ mod tests {
         let output = sponge.hash_iter(input);
 
         assert_eq!(output, [60; OUT]);
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn incremental_padding_free_sponge_matches_every_chunk_boundary() {
+        const WIDTH: usize = 6;
+        const RATE: usize = 3;
+        const OUT: usize = 2;
+
+        let sponge = PaddingFreeSponge::<MockPermutation, WIDTH, RATE, OUT>::new(MockPermutation);
+        for length in 0_u64..=12 {
+            let input = (0..length).map(|value| value + 1).collect::<Vec<_>>();
+            let expected = sponge.hash_iter(input.iter().copied());
+            for split in 0..=input.len() {
+                let mut state = sponge.begin_hash();
+                sponge.absorb(&mut state, input[..split].iter().copied());
+                sponge.absorb(&mut state, core::iter::empty());
+                sponge.absorb(&mut state, input[split..].iter().copied());
+                assert_eq!(sponge.finalize_hash(state), expected);
+            }
+        }
     }
 
     #[test]

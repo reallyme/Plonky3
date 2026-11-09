@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use alloc::vec::Vec;
 use core::arch::aarch64::{self, int32x4_t, uint32x4_t};
 use core::arch::asm;
@@ -60,6 +64,13 @@ impl<P: PackedMontyParameters> IntoVec<P> for MontyField31<P> {
 #[repr(transparent)] // Needed to make `transmute`s safe.
 #[must_use]
 pub struct PackedMontyField31Neon<PMP: PackedMontyParameters>(pub [MontyField31<PMP>; WIDTH]);
+
+#[cfg(feature = "secret-memory")]
+impl<PMP: PackedMontyParameters> zeroize::Zeroize for PackedMontyField31Neon<PMP> {
+    fn zeroize(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
 
 impl<PMP: PackedMontyParameters> PackedMontyField31Neon<PMP> {
     /// Get an arch-specific vector representing the packed values.

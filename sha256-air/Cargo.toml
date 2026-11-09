@@ -1,3 +1,7 @@
+# Modified by ReallyMe Technologies Limited, 2026.
+# SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "p3-sha256-air"
 description = "An AIR implementation of the SHA-256 compression function for use in zero-knowledge proof systems."
@@ -12,6 +16,7 @@ categories.workspace = true
 [features]
 default = []
 parallel = ["p3-maybe-rayon/parallel"]
+secret-memory = ["p3-matrix/secret-memory", "dep:thiserror"]
 
 [dependencies]
 p3-air.workspace = true
@@ -20,10 +25,12 @@ p3-matrix.workspace = true
 p3-maybe-rayon.workspace = true
 
 rand.workspace = true
+thiserror = { workspace = true, optional = true }
 tracing.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
-p3-baby-bear = { path = "../baby-bear" }
+p3-baby-bear = { path = "../baby-bear", features = ["secret-memory"] }
 p3-binary-field = { path = "../binary-field" }
 p3-challenger = { path = "../challenger" }
 p3-commit = { path = "../commit" }

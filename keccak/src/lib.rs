@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The Keccak-f permutation, and hash functions built from it.
 
 #![no_std]
@@ -6,6 +10,9 @@
 extern crate alloc;
 
 use p3_symmetric::{CryptographicHasher, CryptographicPermutation, Permutation};
+use sha3::digest::Output;
+use sha3::digest::zeroize::ZeroizeOnDrop;
+use sha3::{Digest, Sha3_384 as ZeroizingSha3_384, Sha3_512 as ZeroizingSha3_512};
 use tiny_keccak::{Hasher, Keccak, Sha3, keccakf};
 
 mod batch;
@@ -123,30 +130,64 @@ impl Permutation<[u8; 200]> for KeccakF {
 
 impl CryptographicPermutation<[u8; 200]> for KeccakF {}
 
-/// Feed a byte stream to a one-message sponge and return its 256-bit digest.
+/// Feed a byte stream to a one-message sponge and return its fixed-size digest.
 #[inline]
-fn finalize_iter<S: Hasher>(mut sponge: S, input: impl IntoIterator<Item = u8>) -> [u8; 32] {
+fn finalize_iter<const N: usize, S: Hasher>(
+    mut sponge: S,
+    input: impl IntoIterator<Item = u8>,
+) -> [u8; N] {
     const BUFLEN: usize = 512; // Tweakable parameter; determined by experiment
     p3_util::apply_to_chunks::<BUFLEN, _, _>(input, |buf| sponge.update(buf));
 
-    let mut output = [0u8; 32];
+    let mut output = [0u8; N];
     sponge.finalize(&mut output);
     output
 }
 
-/// Feed a run of byte slices to a one-message sponge and return its 256-bit digest.
+/// Feed a run of byte slices to a one-message sponge and return its fixed-size digest.
 #[inline]
-fn finalize_slices<'a, S: Hasher>(
+fn finalize_slices<'a, const N: usize, S: Hasher>(
     mut sponge: S,
     input: impl IntoIterator<Item = &'a [u8]>,
-) -> [u8; 32] {
+) -> [u8; N] {
     for chunk in input {
         sponge.update(chunk);
     }
 
-    let mut output = [0u8; 32];
+    let mut output = [0u8; N];
     sponge.finalize(&mut output);
     output
+}
+
+/// Feed a byte stream to a RustCrypto sponge whose state is erased on drop.
+#[inline]
+fn finalize_zeroizing_iter<const N: usize, D>(
+    mut sponge: D,
+    input: impl IntoIterator<Item = u8>,
+) -> [u8; N]
+where
+    D: Digest + ZeroizeOnDrop,
+    Output<D>: Into<[u8; N]>,
+{
+    const BUFLEN: usize = 512;
+    p3_util::apply_to_chunks::<BUFLEN, _, _>(input, |buf| Digest::update(&mut sponge, buf));
+    sponge.finalize().into()
+}
+
+/// Feed byte slices to a RustCrypto sponge whose state is erased on drop.
+#[inline]
+fn finalize_zeroizing_slices<'a, const N: usize, D>(
+    mut sponge: D,
+    input: impl IntoIterator<Item = &'a [u8]>,
+) -> [u8; N]
+where
+    D: Digest + ZeroizeOnDrop,
+    Output<D>: Into<[u8; N]>,
+{
+    for chunk in input {
+        Digest::update(&mut sponge, chunk);
+    }
+    sponge.finalize().into()
 }
 
 /// The `Keccak` hash functions defined in
@@ -211,6 +252,158 @@ impl CryptographicHasher<u8, [u8; 32]> for Sha3_256Hash {
     }
 }
 
+/// The SHA3-384 hash function of [FIPS 202](https://doi.org/10.6028/NIST.FIPS.202).
+///
+/// Its sponge state is zeroized when hashing completes or unwinds.
+#[derive(Copy, Clone, Debug)]
+pub struct Sha3_384Hash;
+
+impl CryptographicHasher<u8, [u8; 48]> for Sha3_384Hash {
+    fn hash_iter<I>(&self, input: I) -> [u8; 48]
+    where
+        I: IntoIterator<Item = u8>,
+    {
+        finalize_zeroizing_iter(ZeroizingSha3_384::new(), input)
+    }
+
+    fn hash_iter_slices<'a, I>(&self, input: I) -> [u8; 48]
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        finalize_zeroizing_slices(ZeroizingSha3_384::new(), input)
+    }
+}
+
+impl CryptographicHasher<u8, [u64; 6]> for Sha3_384Hash {
+    fn hash_iter<I>(&self, input: I) -> [u64; 6]
+    where
+        I: IntoIterator<Item = u8>,
+    {
+        sha3_384_digest_to_words(finalize_zeroizing_iter(ZeroizingSha3_384::new(), input))
+    }
+
+    fn hash_iter_slices<'a, I>(&self, input: I) -> [u64; 6]
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        sha3_384_digest_to_words(finalize_zeroizing_slices(ZeroizingSha3_384::new(), input))
+    }
+}
+
+/// Hash canonical word streams by absorbing `LE64(word[0]) || LE64(word[1]) || ...`.
+///
+/// This representation is used when SHA3-384 digests feed a Merkle compression layer.
+/// It is independent of native endianness and in-memory layout.
+impl CryptographicHasher<u64, [u64; 6]> for Sha3_384Hash {
+    fn hash_iter<I>(&self, input: I) -> [u64; 6]
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        let bytes = input.into_iter().flat_map(u64::to_le_bytes);
+        sha3_384_digest_to_words(finalize_zeroizing_iter(ZeroizingSha3_384::new(), bytes))
+    }
+}
+
+/// The SHA3-512 hash function of [FIPS 202](https://doi.org/10.6028/NIST.FIPS.202).
+///
+/// Its sponge state is zeroized when hashing completes or unwinds.
+#[derive(Copy, Clone, Debug)]
+pub struct Sha3_512Hash;
+
+impl CryptographicHasher<u8, [u8; 64]> for Sha3_512Hash {
+    fn hash_iter<I>(&self, input: I) -> [u8; 64]
+    where
+        I: IntoIterator<Item = u8>,
+    {
+        finalize_zeroizing_iter(ZeroizingSha3_512::new(), input)
+    }
+
+    fn hash_iter_slices<'a, I>(&self, input: I) -> [u8; 64]
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        finalize_zeroizing_slices(ZeroizingSha3_512::new(), input)
+    }
+}
+
+impl CryptographicHasher<u8, [u64; 8]> for Sha3_512Hash {
+    fn hash_iter<I>(&self, input: I) -> [u64; 8]
+    where
+        I: IntoIterator<Item = u8>,
+    {
+        sha3_512_digest_to_words(finalize_zeroizing_iter(ZeroizingSha3_512::new(), input))
+    }
+
+    fn hash_iter_slices<'a, I>(&self, input: I) -> [u64; 8]
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        sha3_512_digest_to_words(finalize_zeroizing_slices(ZeroizingSha3_512::new(), input))
+    }
+}
+
+/// Hash canonical word streams by absorbing `LE64(word[0]) || LE64(word[1]) || ...`.
+///
+/// This representation is used when SHA3-512 digests feed a Merkle compression layer.
+/// It is independent of native endianness and in-memory layout.
+impl CryptographicHasher<u64, [u64; 8]> for Sha3_512Hash {
+    fn hash_iter<I>(&self, input: I) -> [u64; 8]
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        let bytes = input.into_iter().flat_map(u64::to_le_bytes);
+        sha3_512_digest_to_words(finalize_zeroizing_iter(ZeroizingSha3_512::new(), bytes))
+    }
+}
+
+/// Interpret a SHA3-384 digest as six canonical little-endian words.
+#[must_use]
+pub fn sha3_384_digest_to_words(bytes: [u8; 48]) -> [u64; 6] {
+    let (chunks, _) = bytes.as_chunks::<8>();
+    let mut words = [0; 6];
+    for (word, chunk) in words.iter_mut().zip(chunks) {
+        *word = u64::from_le_bytes(*chunk);
+    }
+    words
+}
+
+/// Interpret a SHA3-512 digest as eight canonical little-endian words.
+#[must_use]
+pub fn sha3_512_digest_to_words(bytes: [u8; 64]) -> [u64; 8] {
+    let (chunks, _) = bytes.as_chunks::<8>();
+    let mut words = [0; 8];
+    for (word, chunk) in words.iter_mut().zip(chunks) {
+        *word = u64::from_le_bytes(*chunk);
+    }
+    words
+}
+
+/// Serialize six canonical SHA3-384 words to the original digest bytes.
+///
+/// This is the inverse of [`sha3_384_digest_to_words`].
+#[must_use]
+pub fn sha3_384_words_to_digest(words: [u64; 6]) -> [u8; 48] {
+    let mut bytes = [0; 48];
+    let (chunks, _) = bytes.as_chunks_mut::<8>();
+    for (chunk, word) in chunks.iter_mut().zip(words) {
+        *chunk = word.to_le_bytes();
+    }
+    bytes
+}
+
+/// Serialize eight canonical SHA3-512 words to the original digest bytes.
+///
+/// This is the inverse of [`sha3_512_digest_to_words`].
+#[must_use]
+pub fn sha3_512_words_to_digest(words: [u64; 8]) -> [u8; 64] {
+    let mut bytes = [0; 64];
+    let (chunks, _) = bytes.as_chunks_mut::<8>();
+    for (chunk, word) in chunks.iter_mut().zip(words) {
+        *chunk = word.to_le_bytes();
+    }
+    bytes
+}
+
 #[cfg(test)]
 mod nist_tests;
 
@@ -220,6 +413,7 @@ mod tests {
     use alloc::vec::Vec;
 
     use hex_literal::hex;
+    use p3_symmetric::{CompressionFunctionFromHasher, PseudoCompressionFunction};
     use proptest::prelude::*;
     use sha3::{Digest, Keccak256, Sha3_256};
 
@@ -373,6 +567,94 @@ mod tests {
         assert_eq!(digests, [sha3; 3]);
     }
 
+    #[test]
+    fn sha3_384_and_512_match_fips_vectors() {
+        let sha3_384_empty = hex!(
+            "0c63a75b845e4f7d01107d852e4c2485c51a50aaaa94fc61995e71bbee983a2a"
+            "c3713831264adb47fb6bd1e058d5f004"
+        );
+        let sha3_384_abc = hex!(
+            "ec01498288516fc926459f58e2c6ad8df9b473cb0fc08c2596da7cf0e49be4b2"
+            "98d88cea927ac7f539f1edf228376d25"
+        );
+        let sha3_512_empty = hex!(
+            "a69f73cca23a9ac5c8b567dc185a756e97c982164fe25859e0d1dcc1475c80a6"
+            "15b2123af1f5f94c11e3e9402c3ac558f500199d95b6d3e301758586281dcd26"
+        );
+        let sha3_512_abc = hex!(
+            "b751850b1a57168a5693cd924b6b096e08f621827444f70d884f5d0240d2712e"
+            "10e116e9192af3c91a7ec57647e3934057340b4cf408d5a56592f8274eec53f0"
+        );
+
+        let digest_384_empty: [u8; 48] = Sha3_384Hash.hash_slice(b"");
+        let digest_384_abc: [u8; 48] = Sha3_384Hash.hash_slice(b"abc");
+        let digest_512_empty: [u8; 64] = Sha3_512Hash.hash_slice(b"");
+        let digest_512_abc: [u8; 64] = Sha3_512Hash.hash_slice(b"abc");
+
+        assert_eq!(digest_384_empty, sha3_384_empty);
+        assert_eq!(digest_384_abc, sha3_384_abc);
+        assert_eq!(digest_512_empty, sha3_512_empty);
+        assert_eq!(digest_512_abc, sha3_512_abc);
+    }
+
+    #[test]
+    fn sha3_word_digests_round_trip_to_normative_bytes() {
+        let bytes_384: [u8; 48] = Sha3_384Hash.hash_slice(b"canonical SHA3-384 encoding");
+        let words_384: [u64; 6] = Sha3_384Hash.hash_slice(b"canonical SHA3-384 encoding");
+        let bytes_512: [u8; 64] = Sha3_512Hash.hash_slice(b"canonical SHA3-512 encoding");
+        let words_512: [u64; 8] = Sha3_512Hash.hash_slice(b"canonical SHA3-512 encoding");
+
+        assert_eq!(sha3_384_words_to_digest(words_384), bytes_384);
+        assert_eq!(sha3_512_words_to_digest(words_512), bytes_512);
+        assert_eq!(sha3_384_digest_to_words(bytes_384), words_384);
+        assert_eq!(sha3_512_digest_to_words(bytes_512), words_512);
+    }
+
+    #[test]
+    fn sha3_word_inputs_use_canonical_little_endian_bytes() {
+        let words = [
+            0x0001_0203_0405_0607_u64,
+            0x8899_aabb_ccdd_eeff,
+            0x1020_3040_5060_7080,
+        ];
+        let bytes: Vec<u8> = words.into_iter().flat_map(u64::to_le_bytes).collect();
+
+        let expected_384: [u8; 48] = Sha3_384Hash.hash_slice(&bytes);
+        let actual_384: [u64; 6] = Sha3_384Hash.hash_slice(&words);
+        let expected_512: [u8; 64] = Sha3_512Hash.hash_slice(&bytes);
+        let actual_512: [u64; 8] = Sha3_512Hash.hash_slice(&words);
+
+        assert_eq!(sha3_384_words_to_digest(actual_384), expected_384);
+        assert_eq!(sha3_512_words_to_digest(actual_512), expected_512);
+    }
+
+    #[test]
+    fn sha3_segmented_byte_inputs_match_contiguous_inputs() {
+        let segments: [&[u8]; 4] = [b"segmented", b" SHA3", b" input", b""];
+        let contiguous = b"segmented SHA3 input";
+
+        let segmented_384: [u8; 48] = Sha3_384Hash.hash_iter_slices(segments);
+        let contiguous_384: [u8; 48] = Sha3_384Hash.hash_slice(contiguous);
+        let segmented_512: [u8; 64] = Sha3_512Hash.hash_iter_slices(segments);
+        let contiguous_512: [u8; 64] = Sha3_512Hash.hash_slice(contiguous);
+
+        assert_eq!(segmented_384, contiguous_384);
+        assert_eq!(segmented_512, contiguous_512);
+    }
+
+    #[test]
+    fn sha3_word_hashers_compose_with_binary_merkle_compression() {
+        let children_384 = [[0x11_u64; 6], [0x22_u64; 6]];
+        let compression_384 = CompressionFunctionFromHasher::<_, 2, 6>::new(Sha3_384Hash);
+        let expected_384: [u64; 6] = Sha3_384Hash.hash_slice(children_384.as_flattened());
+        assert_eq!(compression_384.compress(children_384), expected_384);
+
+        let children_512 = [[0x33_u64; 8], [0x44_u64; 8]];
+        let compression_512 = CompressionFunctionFromHasher::<_, 2, 8>::new(Sha3_512Hash);
+        let expected_512: [u64; 8] = Sha3_512Hash.hash_slice(children_512.as_flattened());
+        assert_eq!(compression_512.compress(children_512), expected_512);
+    }
+
     /// A cheap deterministic byte stream, so a failing case shrinks reproducibly.
     fn stream(seed: u64, len: usize) -> Vec<u8> {
         let mut x = seed | 1;
@@ -429,6 +711,21 @@ mod tests {
                 kernel.hash_many(SHA3_DOMAIN, &messages, len, &mut batched);
                 prop_assert_eq!(&batched, &expected, "{:?}", kernel);
             }
+        }
+
+        #[test]
+        fn sha3_384_and_512_match_independent_implementations(
+            len in 0usize..=600,
+            seed in any::<u64>(),
+        ) {
+            let message = stream(seed, len);
+            let digest_384: [u8; 48] = Sha3_384Hash.hash_slice(&message);
+            let digest_512: [u8; 64] = Sha3_512Hash.hash_slice(&message);
+            let expected_384 = finalize_iter(Sha3::v384(), message.iter().copied());
+            let expected_512 = finalize_iter(Sha3::v512(), message.iter().copied());
+
+            prop_assert_eq!(digest_384, expected_384);
+            prop_assert_eq!(digest_512, expected_512);
         }
 
         #[test]

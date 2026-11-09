@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Shared data between batch-STARK prover and verifier.
 //!
 //! This module is intended to store per-instance data that is common to both
@@ -21,6 +25,8 @@ use p3_util::log2_strict_usize;
 
 use crate::ProvingError;
 use crate::config::{Challenge, Commitment, Domain, PcsProverError, StarkGenericConfig as SGC};
+#[cfg(feature = "secret-memory")]
+use crate::prover::GuardedStarkInstance;
 use crate::prover::StarkInstance;
 use crate::symbolic::get_log_num_quotient_chunks_for_domain;
 
@@ -172,6 +178,36 @@ where
             .map(|&d| log2_strict_usize(d) + config.is_zk())
             .collect();
         let airs: Vec<A> = instances.iter().map(|i| i.air.clone()).collect();
+        Self::from_airs_and_degrees(config, &airs, &log_ext_degrees)
+    }
+
+    /// Build [`ProverData`] from guarded STARK instances without copying or exposing their
+    /// execution traces.
+    ///
+    /// This derives only the trace heights and AIR metadata. The guarded matrices remain owned by
+    /// their instances until [`crate::prove_batch_guarded_inputs`] consumes them.
+    #[cfg(feature = "secret-memory")]
+    pub fn from_guarded_instances<A>(
+        config: &SC,
+        instances: &[GuardedStarkInstance<'_, SC, A>],
+    ) -> Result<Self, ProvingError<PcsProverError<SC>>>
+    where
+        SymbolicExpressionExt<Val<SC>, SC::Challenge>: Algebra<SC::Challenge>,
+        A: Air<InteractionSymbolicBuilder<Val<SC>, SC::Challenge>> + Clone,
+        Val<SC>: zeroize::Zeroize,
+    {
+        let degrees: Vec<usize> = instances
+            .iter()
+            .map(GuardedStarkInstance::trace_height)
+            .collect();
+        let log_ext_degrees: Vec<usize> = degrees
+            .iter()
+            .map(|&degree| log2_strict_usize(degree) + config.is_zk())
+            .collect();
+        let airs: Vec<A> = instances
+            .iter()
+            .map(|instance| instance.air.clone())
+            .collect();
         Self::from_airs_and_degrees(config, &airs, &log_ext_degrees)
     }
 

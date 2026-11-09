@@ -1,3 +1,7 @@
+<!-- Modified by ReallyMe Technologies Limited, 2026. -->
+<!-- SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited -->
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+
 # Changelog
 
 All notable changes to this project will be documented in this file.
@@ -6,6 +10,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- Add guarded packed quotient evaluation with typed geometry and allocation failures, zeroizing
+  row-group scratch, and a consuming guarded handoff through quotient flattening and PCS
+  commitment. Tests pin evaluation and commitment parity with the ordinary path.
+- Add guarded acquisition of main and permutation quotient-domain matrices from PCS prover data,
+  with typed phase failures and direct consumption by guarded AIR quotient evaluation.
+- Add a guarded batch main-trace commitment handoff that duplicates source evaluations only between
+  zeroizing owners and retains the originals for post-commitment lookup generation.
+- Add a consuming guarded permutation-trace handoff that flattens extension-field LogUp traces and
+  commits the resulting base-field matrices without an ordinary secret-derived allocation.
+- Add a guarded multi-instance quotient handoff that consumes extension-field owners, preserves
+  instance and chunk order, and commits every quotient under the existing single global root.
+- Add a complete guarded batch-STARK prover entry point with typed preflight and phase errors,
+  mixed public-preprocessing/private-witness openings, lookup permutation composition, explicit
+  source-trace release, and compatibility with the existing verifier. Tests cover ordinary-proof
+  parity, preprocessing and lookup composition, and fail-closed malformed inputs.
+- Add an opt-in guarded-prover phase observer with typed start and completion events for
+  preparation, commitments, lookup generation, each instance quotient, opening, and proof
+  assembly. The observer receives no witness or transcript values and the ordinary proving entry
+  point retains a no-op observer.
+- Write guarded batch quotients directly into the base-field coefficient layout consumed by the
+  PCS. The compatibility API still returns an extension-field column, but complete batch proving
+  no longer allocates that column and a second flattened copy before the shared quotient
+  commitment.
+- Transfer guarded main traces directly into the PCS during complete batch proving instead of
+  retaining a second full source batch. Lookup generation reconstructs only its current main trace
+  from compact committed coefficients under a zeroizing owner, validates its geometry, and erases
+  it before advancing to the next AIR. The public commitment helper continues to preserve caller
+  sources for compatibility.
+- Generate and transfer each instance quotient into the guarded PCS before evaluating the next
+  instance. The PCS still commits every transformed chunk under one canonical global root; this
+  shortens contiguous quotient lifetime but does not remove the shared commitment's retained LDE
+  live set.
+- Route end-to-end guarded main and lookup-permutation commitments through detached PCS
+  construction, releasing each full LDE after Merkle absorption while retaining reconstructable
+  coefficients and authentication-only state. Public compatibility helpers keep their prior
+  retained-data behavior.
+
 ## [0.8.0] - 2026-09-23
 ### Merged PRs
 - Fix(circle): account for transition selectors in quotient sizing (#2046)
@@ -178,4 +220,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Thomas Coratger
 - Zach Langley
 - o-k-d
-

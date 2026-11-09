@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #![doc = include_str!("../README.md")]
 #![no_std]
 
@@ -25,6 +29,12 @@ pub use config::{
 pub use error::BatchVerificationError;
 pub use p3_uni_stark::{OpenedValues, ProvingError, VerificationError};
 pub use proof::{BatchCommitments, BatchOpenedValues, BatchProof};
+#[cfg(feature = "secret-memory")]
+pub use prover::{
+    GuardedStarkInstance, SecretBatchProvingError, SecretBatchProvingObserver,
+    SecretBatchProvingPhase, SecretBatchProvingResult, SecretQuotientChunkAuditStatus,
+    prove_batch_guarded_inputs, prove_batch_secret, prove_batch_secret_with_observer,
+};
 pub use prover::{StarkInstance, prove_batch};
 pub use security::num_batched_openings;
 pub use transcript::{

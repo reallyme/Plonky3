@@ -1,3 +1,7 @@
+# Modified by ReallyMe Technologies Limited, 2026.
+# SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "p3-lookup"
 description = "LogUp: Logarithmic lookup arguments and multiset equality checks with multiplicities support."
@@ -11,6 +15,7 @@ categories.workspace = true
 [features]
 default = []
 parallel = ["p3-maybe-rayon/parallel"]
+secret-memory = ["p3-field/secret-memory", "p3-matrix/secret-memory", "zeroize"]
 
 [dependencies]
 hashbrown = { workspace = true }
@@ -23,10 +28,11 @@ p3-maybe-rayon = { workspace = true }
 serde = { workspace = true, features = ["derive", "alloc"] }
 thiserror.workspace = true
 tracing = { workspace = true }
+zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
-p3-baby-bear = { path = "../baby-bear" }
+p3-baby-bear = { path = "../baby-bear", features = ["secret-memory"] }
 rand.workspace = true
 serde_json.workspace = true
 

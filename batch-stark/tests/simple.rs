@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #[path = "common/config.rs"]
 mod config;
 
@@ -11,21 +15,41 @@ use config::{
     Val, make_circle_config, make_config, make_config_allow_tiny_trace, make_config_wide,
     make_config_zk, make_two_adic_compat_config,
 };
+#[cfg(feature = "secret-memory")]
+use config::{SecretConfig, SecretHidingConfig, make_secret_config, make_secret_hiding_config};
+#[cfg(feature = "secret-memory")]
+use p3_air::symbolic::AirLayout;
 use p3_air::{
     Air, AirBuilder, BaseAir, NextRowTrace, PermutationAirBuilder, SymbolicExpression, WindowAccess,
 };
 use p3_batch_stark::proof::{BatchProof, OpenedValuesWithLookups};
+#[cfg(feature = "secret-memory")]
+use p3_batch_stark::prover::{
+    SecretBatchQuotient, SecretMainTraceCommitError, SecretPcsQuotientError, SecretQuotientError,
+    commit_main_traces_secret, commit_permutation_traces_secret,
+    commit_quotient_batch_values_secret, commit_quotient_values_secret, quotient_values,
+    quotient_values_from_secret_pcs, quotient_values_secret,
+};
 use p3_batch_stark::verifier::commitments_with_opening_points;
 use p3_batch_stark::{
     BatchShape, BatchTranscriptFailure, BatchVerificationError, ProverData, ProvingError,
     StarkGenericConfig, StarkInstance, VerificationError, prove_batch, verify_batch,
 };
+#[cfg(feature = "secret-memory")]
+use p3_batch_stark::{
+    GuardedStarkInstance, SecretBatchProvingError, SecretBatchProvingObserver,
+    SecretBatchProvingPhase, prove_batch_secret, prove_batch_secret_with_observer,
+};
 use p3_challenger::testing::pow_difficulties;
+#[cfg(feature = "secret-memory")]
+use p3_commit::SecretProverData;
 use p3_field::{Field, PrimeCharacteristicRing, PrimeField64, TwoAdicField};
 use p3_fri::{FriParameters, FriShape, PcsShape};
 use p3_lookup::{
     Count, InteractionBuilder, LookupError, LookupTerminal, Lookups, SymbolicInteraction,
 };
+#[cfg(feature = "secret-memory")]
+use p3_lookup::{LogUpGadget, LookupProtocol};
 use p3_matrix::Matrix;
 use p3_matrix::dense::RowMajorMatrix;
 use p3_security::grinding::{GrindingBudget, GrindingSites, RecordedGrind};
@@ -34,6 +58,24 @@ use p3_util::log2_strict_usize;
 
 const TWO_ADIC_FIXTURE: &str = "tests/fixtures/batch_stark_two_adic_v0_8_0.postcard";
 const CIRCLE_FIXTURE: &str = "tests/fixtures/batch_stark_circle_v0_8_0.postcard";
+
+#[cfg(feature = "secret-memory")]
+#[derive(Default)]
+struct RecordingSecretBatchObserver {
+    started: Vec<SecretBatchProvingPhase>,
+    completed: Vec<SecretBatchProvingPhase>,
+}
+
+#[cfg(feature = "secret-memory")]
+impl SecretBatchProvingObserver for RecordingSecretBatchObserver {
+    fn phase_started(&mut self, phase: SecretBatchProvingPhase) {
+        self.started.push(phase);
+    }
+
+    fn phase_completed(&mut self, phase: SecretBatchProvingPhase) {
+        self.completed.push(phase);
+    }
+}
 
 // --- Simple Fibonacci AIR and trace ---
 
@@ -642,6 +684,825 @@ fn create_preprocessed_mul_instance(
     (air, trace, pis)
 }
 
+#[cfg(feature = "secret-memory")]
+#[test]
+fn guarded_quotient_matches_ordinary_and_commits_without_releasing_its_owner() {
+    use p3_commit::{
+        Pcs, PolynomialSpace, SecretPcsCommitter, SecretProverData, UnivariateStarkPcs,
+    };
+
+    const TRACE_SIZE: usize = 16;
+    const QUOTIENT_SIZE: usize = 32;
+
+    let config = make_secret_config(0x5155_4f54_4945_4e54);
+    let (air, trace, public_values) = create_mul_instance(4, 2);
+    let pcs = config.pcs();
+    type ConfigChallenger = <SecretConfig as StarkGenericConfig>::Challenger;
+    let trace_domain =
+        <_ as Pcs<Challenge, ConfigChallenger>>::natural_domain_for_degree(pcs, TRACE_SIZE);
+    let quotient_domain = trace_domain.create_disjoint_domain(QUOTIENT_SIZE);
+    let (_, trace_data) =
+        <_ as Pcs<Challenge, ConfigChallenger>>::commit(pcs, [(trace_domain, trace.clone())])
+            .expect("valid trace commitment must succeed");
+    let (_, guarded_trace_data) =
+        <_ as SecretPcsCommitter<Challenge, ConfigChallenger>>::commit_secret(
+            pcs,
+            vec![(trace_domain, SecretProverData::new(trace))],
+        )
+        .expect("valid guarded trace commitment must succeed");
+    let trace_on_quotient_domain =
+        <_ as UnivariateStarkPcs<Challenge, ConfigChallenger>>::get_evaluations_on_domain(
+            pcs,
+            &trace_data,
+            0,
+            quotient_domain,
+        );
+    let layout = AirLayout {
+        main_width: <DemoAir as BaseAir<Val>>::width(&air),
+        num_public_values: public_values.len(),
+        ..Default::default()
+    };
+    let lookup_gadget = LogUpGadget::new();
+    let alpha = Challenge::from(Val::from_u64(0x00A1_1FA5));
+
+    let ordinary = quotient_values::<SecretConfig, _, _, _>(
+        pcs,
+        &air,
+        &public_values,
+        layout,
+        trace_domain,
+        quotient_domain,
+        &trace_on_quotient_domain,
+        None,
+        &[],
+        &[],
+        &lookup_gadget,
+        &[],
+        None,
+        alpha,
+    );
+    let guarded = quotient_values_secret::<SecretConfig, _, _, _>(
+        pcs,
+        &air,
+        &public_values,
+        layout,
+        trace_domain,
+        quotient_domain,
+        &trace_on_quotient_domain,
+        None,
+        &[],
+        &[],
+        &lookup_gadget,
+        &[],
+        None,
+        alpha,
+    )
+    .expect("valid guarded quotient evaluation must succeed");
+
+    assert_eq!(guarded.width, 1);
+    assert_eq!(guarded.values, ordinary);
+
+    let guarded_from_pcs = quotient_values_from_secret_pcs::<SecretConfig, _, _>(
+        pcs,
+        &air,
+        &public_values,
+        layout,
+        trace_domain,
+        quotient_domain,
+        &guarded_trace_data,
+        0,
+        None,
+        &[],
+        &[],
+        &lookup_gadget,
+        &[],
+        None,
+        alpha,
+    )
+    .expect("guarded PCS-to-quotient composition must succeed");
+    assert_eq!(guarded_from_pcs.width, 1);
+    assert_eq!(guarded_from_pcs.values, ordinary);
+
+    let invalid_index = quotient_values_from_secret_pcs::<SecretConfig, _, _>(
+        pcs,
+        &air,
+        &public_values,
+        layout,
+        trace_domain,
+        quotient_domain,
+        &guarded_trace_data,
+        1,
+        None,
+        &[],
+        &[],
+        &lookup_gadget,
+        &[],
+        None,
+        alpha,
+    );
+    assert!(matches!(
+        invalid_index,
+        Err(SecretPcsQuotientError::MainEvaluation(_))
+    ));
+
+    let ordinary_flat = RowMajorMatrix::new_col(ordinary).flatten_to_base();
+    let (ordinary_commitment, _) =
+        <_ as UnivariateStarkPcs<Challenge, ConfigChallenger>>::commit_quotient(
+            pcs,
+            quotient_domain,
+            ordinary_flat,
+            2,
+        )
+        .expect("valid ordinary quotient commitment must succeed");
+    let (guarded_commitment, _) =
+        commit_quotient_values_secret::<SecretConfig>(pcs, quotient_domain, guarded, 2)
+            .expect("valid guarded quotient commitment must succeed");
+    assert_eq!(guarded_commitment, ordinary_commitment);
+}
+
+#[cfg(feature = "secret-memory")]
+#[test]
+fn guarded_lookup_quotient_on_split_cosets_matches_interleaved_full_domain() {
+    use p3_commit::{Pcs, PolynomialSpace, UnivariateStarkPcs};
+    use p3_lookup::Lookups;
+
+    const TRACE_SIZE: usize = 16;
+    const QUOTIENT_SIZE: usize = 64;
+    const NUM_CHUNKS: usize = 4;
+
+    let config = make_secret_config(0x5350_4c49_545f_4c55);
+    let pcs = config.pcs();
+    type ConfigChallenger = <SecretConfig as StarkGenericConfig>::Challenger;
+    let trace_domain =
+        <_ as Pcs<Challenge, ConfigChallenger>>::natural_domain_for_degree(pcs, TRACE_SIZE);
+    let quotient_domain = trace_domain.create_disjoint_domain(QUOTIENT_SIZE);
+    let air = MulAirLookups::new(MulAir { reps: 2 }, true, false, Vec::new());
+    let trace = mul_trace::<Val>(TRACE_SIZE, 2);
+    let lookups: Lookups<Val> = Lookups::from_air::<Challenge, _>(&air)
+        .expect("valid multiplication AIR must define bounded lookups");
+    let mut challenges = Vec::new();
+    for index in 0..lookups.len() {
+        let challenge_offset = u64::try_from(index)
+            .expect("bounded lookup index must fit")
+            .checked_add(7)
+            .expect("bounded lookup challenge must fit");
+        challenges.push(Challenge::new([
+            Val::from_u64(challenge_offset),
+            Val::ONE,
+            Val::ZERO,
+            Val::ZERO,
+        ]));
+        challenges.push(Challenge::from(Val::from_u64(11)));
+    }
+    let lookup_gadget = LogUpGadget::new();
+    let (permutation, terminal) = lookup_gadget.generate_permutation::<Val, Challenge>(
+        &trace,
+        &None,
+        &[],
+        &[],
+        &lookups,
+        &challenges,
+    );
+    let terminal = terminal.expect("the lookup fixture must have a terminal value");
+    let permutation = permutation.flatten_to_base();
+    let (_, main_data) =
+        <_ as Pcs<Challenge, ConfigChallenger>>::commit(pcs, [(trace_domain, trace)])
+            .expect("valid main commitment must succeed");
+    let (_, permutation_data) =
+        <_ as Pcs<Challenge, ConfigChallenger>>::commit(pcs, [(trace_domain, permutation)])
+            .expect("valid permutation commitment must succeed");
+    let layout = AirLayout {
+        main_width: <MulAirLookups as BaseAir<Val>>::width(&air),
+        ..Default::default()
+    };
+    let alpha = Challenge::from(Val::from_u64(0x00A1_1FA5));
+    let full_main =
+        <_ as UnivariateStarkPcs<Challenge, ConfigChallenger>>::get_evaluations_on_domain(
+            pcs,
+            &main_data,
+            0,
+            quotient_domain,
+        )
+        .to_row_major_matrix();
+    let full_permutation =
+        <_ as UnivariateStarkPcs<Challenge, ConfigChallenger>>::get_evaluations_on_domain(
+            pcs,
+            &permutation_data,
+            0,
+            quotient_domain,
+        )
+        .to_row_major_matrix();
+    let full = quotient_values_secret::<SecretConfig, _, _, _>(
+        pcs,
+        &air,
+        &[],
+        layout,
+        trace_domain,
+        quotient_domain,
+        &full_main,
+        Some(&full_permutation),
+        &lookups,
+        &[terminal.0],
+        &lookup_gadget,
+        &challenges,
+        None,
+        alpha,
+    )
+    .expect("full-domain guarded lookup quotient must succeed");
+
+    for (chunk_index, chunk_domain) in quotient_domain
+        .split_domains(NUM_CHUNKS)
+        .into_iter()
+        .enumerate()
+    {
+        let chunk_main =
+            <_ as UnivariateStarkPcs<Challenge, ConfigChallenger>>::get_evaluations_on_domain(
+                pcs,
+                &main_data,
+                0,
+                chunk_domain,
+            )
+            .to_row_major_matrix();
+        let chunk_permutation =
+            <_ as UnivariateStarkPcs<Challenge, ConfigChallenger>>::get_evaluations_on_domain(
+                pcs,
+                &permutation_data,
+                0,
+                chunk_domain,
+            )
+            .to_row_major_matrix();
+        let chunk = quotient_values_secret::<SecretConfig, _, _, _>(
+            pcs,
+            &air,
+            &[],
+            layout,
+            trace_domain,
+            chunk_domain,
+            &chunk_main,
+            Some(&chunk_permutation),
+            &lookups,
+            &[terminal.0],
+            &lookup_gadget,
+            &challenges,
+            None,
+            alpha,
+        )
+        .expect("split-domain guarded lookup quotient must succeed");
+
+        for local_row in 0..chunk.height() {
+            let full_row = local_row
+                .checked_mul(NUM_CHUNKS)
+                .and_then(|row| row.checked_add(chunk_index))
+                .expect("fixed test row mapping must fit");
+            assert_eq!(chunk.get(local_row, 0), full.get(full_row, 0));
+        }
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+#[test]
+fn guarded_periodic_quotient_on_split_cosets_matches_interleaved_full_domain() {
+    use p3_commit::{Pcs, PolynomialSpace, UnivariateStarkPcs};
+
+    const TRACE_SIZE: usize = 16;
+    const QUOTIENT_SIZE: usize = 256;
+    const NUM_CHUNKS: usize = 8;
+
+    let config = make_secret_config(0x5350_4c49_545f_5043);
+    let pcs = config.pcs();
+    type ConfigChallenger = <SecretConfig as StarkGenericConfig>::Challenger;
+    let trace_domain =
+        <_ as Pcs<Challenge, ConfigChallenger>>::natural_domain_for_degree(pcs, TRACE_SIZE);
+    let quotient_domain = trace_domain.create_disjoint_domain(QUOTIENT_SIZE);
+    let air = PeriodicAir::<Val> {
+        periodic: vec![
+            (0..TRACE_SIZE)
+                .map(|index| Val::from_usize(index + 1))
+                .collect(),
+            (0..TRACE_SIZE)
+                .map(|index| Val::from_usize((index + 1) * 3))
+                .collect(),
+        ],
+    };
+    let trace = air.valid_trace(TRACE_SIZE);
+    let (_, main_data) =
+        <_ as Pcs<Challenge, ConfigChallenger>>::commit(pcs, [(trace_domain, trace)])
+            .expect("valid periodic trace commitment must succeed");
+    let layout = AirLayout {
+        main_width: <PeriodicAir<Val> as BaseAir<Val>>::width(&air),
+        num_periodic_columns: <PeriodicAir<Val> as BaseAir<Val>>::num_periodic_columns(&air),
+        ..Default::default()
+    };
+    let alpha = Challenge::from(Val::from_u64(0x00A1_1FA5));
+    let full_main =
+        <_ as UnivariateStarkPcs<Challenge, ConfigChallenger>>::get_evaluations_on_domain(
+            pcs,
+            &main_data,
+            0,
+            quotient_domain,
+        )
+        .to_row_major_matrix();
+    let full = quotient_values_secret::<SecretConfig, _, _, _>(
+        pcs,
+        &air,
+        &[],
+        layout,
+        trace_domain,
+        quotient_domain,
+        &full_main,
+        None,
+        &[],
+        &[],
+        &LogUpGadget::new(),
+        &[],
+        None,
+        alpha,
+    )
+    .expect("full-domain guarded periodic quotient must succeed");
+
+    for (chunk_index, chunk_domain) in quotient_domain
+        .split_domains(NUM_CHUNKS)
+        .into_iter()
+        .enumerate()
+    {
+        let chunk_main =
+            <_ as UnivariateStarkPcs<Challenge, ConfigChallenger>>::get_evaluations_on_domain(
+                pcs,
+                &main_data,
+                0,
+                chunk_domain,
+            )
+            .to_row_major_matrix();
+        let chunk = quotient_values_secret::<SecretConfig, _, _, _>(
+            pcs,
+            &air,
+            &[],
+            layout,
+            trace_domain,
+            chunk_domain,
+            &chunk_main,
+            None,
+            &[],
+            &[],
+            &LogUpGadget::new(),
+            &[],
+            None,
+            alpha,
+        )
+        .expect("split-domain guarded periodic quotient must succeed");
+
+        for local_row in 0..chunk.height() {
+            let full_row = local_row
+                .checked_mul(NUM_CHUNKS)
+                .and_then(|row| row.checked_add(chunk_index))
+                .expect("fixed test row mapping must fit");
+            assert_eq!(chunk.get(local_row, 0), full.get(full_row, 0));
+        }
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+#[test]
+fn guarded_hiding_lookup_quotient_on_split_cosets_matches_full_domain() {
+    use p3_commit::{
+        Pcs, PolynomialSpace, SecretPcsCommitter, SecretProverData,
+        SecretUnivariateStarkPcsEvaluator,
+    };
+    use p3_lookup::Lookups;
+
+    const TRACE_SIZE: usize = 16;
+    const COMMITTED_SIZE: usize = TRACE_SIZE * 2;
+    const QUOTIENT_SIZE: usize = 128;
+    const NUM_CHUNKS: usize = 4;
+
+    let config = make_secret_hiding_config(0x5350_4c49_545f_5a4b);
+    let pcs = config.pcs();
+    type ConfigChallenger = <SecretHidingConfig as StarkGenericConfig>::Challenger;
+    let trace_domain =
+        <_ as Pcs<Challenge, ConfigChallenger>>::natural_domain_for_degree(pcs, TRACE_SIZE);
+    let committed_domain =
+        <_ as Pcs<Challenge, ConfigChallenger>>::natural_domain_for_degree(pcs, COMMITTED_SIZE);
+    let quotient_domain = committed_domain.create_disjoint_domain(QUOTIENT_SIZE);
+    let air = MulAirLookups::new(MulAir { reps: 2 }, true, false, Vec::new());
+    let trace = mul_trace::<Val>(TRACE_SIZE, 2);
+    let lookups: Lookups<Val> = Lookups::from_air::<Challenge, _>(&air)
+        .expect("valid multiplication AIR must define bounded lookups");
+    let mut challenges = Vec::new();
+    for index in 0..lookups.len() {
+        let challenge_offset = u64::try_from(index)
+            .expect("bounded lookup index must fit")
+            .checked_add(7)
+            .expect("bounded lookup challenge must fit");
+        challenges.push(Challenge::new([
+            Val::from_u64(challenge_offset),
+            Val::ONE,
+            Val::ZERO,
+            Val::ZERO,
+        ]));
+        challenges.push(Challenge::from(Val::from_u64(11)));
+    }
+    let lookup_gadget = LogUpGadget::new();
+    let (permutation, terminal) = lookup_gadget.generate_permutation::<Val, Challenge>(
+        &trace,
+        &None,
+        &[],
+        &[],
+        &lookups,
+        &challenges,
+    );
+    let terminal = terminal.expect("the lookup fixture must have a terminal value");
+    let (_, main_data) = <_ as SecretPcsCommitter<Challenge, ConfigChallenger>>::commit_secret(
+        pcs,
+        vec![(committed_domain, SecretProverData::new(trace))],
+    )
+    .expect("valid guarded hiding main commitment must succeed");
+    let (_, permutation_data) =
+        <_ as SecretPcsCommitter<Challenge, ConfigChallenger>>::commit_secret(
+            pcs,
+            vec![(
+                committed_domain,
+                SecretProverData::new(permutation.flatten_to_base()),
+            )],
+        )
+        .expect("valid guarded hiding permutation commitment must succeed");
+    let layout = AirLayout {
+        main_width: <MulAirLookups as BaseAir<Val>>::width(&air),
+        ..Default::default()
+    };
+    let alpha = Challenge::from(Val::from_u64(0x00A1_1FA5));
+    let full_main = <_ as SecretUnivariateStarkPcsEvaluator<Challenge, ConfigChallenger>>::
+        get_evaluations_on_domain_secret(pcs, &main_data, 0, quotient_domain)
+        .expect("full guarded hiding main evaluation must succeed");
+    let full_permutation = <_ as SecretUnivariateStarkPcsEvaluator<
+        Challenge,
+        ConfigChallenger,
+    >>::get_evaluations_on_domain_secret(pcs, &permutation_data, 0, quotient_domain)
+    .expect("full guarded hiding permutation evaluation must succeed");
+    let full = quotient_values_secret::<SecretHidingConfig, _, _, _>(
+        pcs,
+        &air,
+        &[],
+        layout,
+        trace_domain,
+        quotient_domain,
+        &full_main,
+        Some(&full_permutation),
+        &lookups,
+        &[terminal.0],
+        &lookup_gadget,
+        &challenges,
+        None,
+        alpha,
+    )
+    .expect("full-domain guarded hiding lookup quotient must succeed");
+
+    for (chunk_index, chunk_domain) in quotient_domain
+        .split_domains(NUM_CHUNKS)
+        .into_iter()
+        .enumerate()
+    {
+        let chunk_main = <_ as SecretUnivariateStarkPcsEvaluator<
+            Challenge,
+            ConfigChallenger,
+        >>::get_evaluations_on_domain_secret(pcs, &main_data, 0, chunk_domain)
+        .expect("split guarded hiding main evaluation must succeed");
+        let chunk_permutation = <_ as SecretUnivariateStarkPcsEvaluator<
+            Challenge,
+            ConfigChallenger,
+        >>::get_evaluations_on_domain_secret(
+            pcs, &permutation_data, 0, chunk_domain
+        )
+        .expect("split guarded hiding permutation evaluation must succeed");
+        let chunk = quotient_values_secret::<SecretHidingConfig, _, _, _>(
+            pcs,
+            &air,
+            &[],
+            layout,
+            trace_domain,
+            chunk_domain,
+            &chunk_main,
+            Some(&chunk_permutation),
+            &lookups,
+            &[terminal.0],
+            &lookup_gadget,
+            &challenges,
+            None,
+            alpha,
+        )
+        .expect("split-domain guarded hiding lookup quotient must succeed");
+
+        for local_row in 0..chunk.height() {
+            let full_row = local_row
+                .checked_mul(NUM_CHUNKS)
+                .and_then(|row| row.checked_add(chunk_index))
+                .expect("fixed test row mapping must fit");
+            assert_eq!(chunk.get(local_row, 0), full.get(full_row, 0));
+        }
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+#[test]
+fn guarded_batch_quotients_share_the_standard_global_commitment() {
+    use p3_commit::{Pcs, PolynomialSpace, SecretProverData, UnivariateStarkPcs};
+
+    const FIRST_SIZE: usize = 32;
+    const FIRST_CHUNKS: usize = 2;
+    const SECOND_SIZE: usize = 64;
+    const SECOND_CHUNKS: usize = 4;
+
+    let config = make_secret_config(0x4241_5443_485f_5154);
+    let pcs = config.pcs();
+    type ConfigChallenger = <SecretConfig as StarkGenericConfig>::Challenger;
+    let first_domain =
+        <_ as Pcs<Challenge, ConfigChallenger>>::natural_domain_for_degree(pcs, FIRST_SIZE);
+    let second_domain =
+        <_ as Pcs<Challenge, ConfigChallenger>>::natural_domain_for_degree(pcs, SECOND_SIZE);
+    let first = RowMajorMatrix::new(
+        (0..FIRST_SIZE)
+            .map(|index| Challenge::from(Val::from_usize(index)))
+            .collect(),
+        1,
+    );
+    let second = RowMajorMatrix::new(
+        (FIRST_SIZE..FIRST_SIZE + SECOND_SIZE)
+            .map(|index| Challenge::from(Val::from_usize(index)))
+            .collect(),
+        1,
+    );
+
+    let mut ordinary_ldes = Vec::new();
+    for (domain, matrix, num_chunks) in [
+        (first_domain, first.clone(), FIRST_CHUNKS),
+        (second_domain, second.clone(), SECOND_CHUNKS),
+    ] {
+        let flattened = matrix.flatten_to_base();
+        let chunk_domains = domain.split_domains(num_chunks);
+        let chunk_matrices = domain.split_evals(num_chunks, flattened);
+        let chunk_ldes = <_ as UnivariateStarkPcs<Challenge, ConfigChallenger>>::get_quotient_ldes(
+            pcs,
+            chunk_domains.into_iter().zip(chunk_matrices),
+            num_chunks,
+        )
+        .expect("valid ordinary quotient LDE batch must succeed");
+        ordinary_ldes.extend(chunk_ldes);
+    }
+    let (expected_commitment, _) =
+        <_ as UnivariateStarkPcs<Challenge, ConfigChallenger>>::commit_ldes(pcs, ordinary_ldes)
+            .expect("valid ordinary global quotient commitment must succeed");
+
+    let (commitment, _) = commit_quotient_batch_values_secret::<SecretConfig>(
+        pcs,
+        vec![
+            SecretBatchQuotient::new(first_domain, SecretProverData::new(first), FIRST_CHUNKS),
+            SecretBatchQuotient::new(second_domain, SecretProverData::new(second), SECOND_CHUNKS),
+        ],
+    )
+    .expect("valid guarded global quotient commitment must succeed");
+
+    assert_eq!(commitment, expected_commitment);
+}
+
+#[cfg(feature = "secret-memory")]
+#[test]
+fn guarded_batch_main_commitment_matches_ordinary_and_preserves_sources() {
+    use p3_commit::{Pcs, SecretProverData};
+
+    const TRACE_SIZE: usize = 16;
+
+    let config = make_secret_config(0x4d41_494e_5f47_5541);
+    let pcs = config.pcs();
+    type ConfigChallenger = <SecretConfig as StarkGenericConfig>::Challenger;
+    let domain =
+        <_ as Pcs<Challenge, ConfigChallenger>>::natural_domain_for_degree(pcs, TRACE_SIZE);
+    let (_, first_trace, _) = create_mul_instance(4, 2);
+    let (_, second_trace, _) = create_mul_instance(4, 3);
+    let first_values = first_trace.values.clone();
+    let second_values = second_trace.values.clone();
+    let ordinary_inputs = vec![
+        (domain, first_trace.clone()),
+        (domain, second_trace.clone()),
+    ];
+    let guarded_traces = vec![
+        SecretProverData::new(first_trace),
+        SecretProverData::new(second_trace),
+    ];
+    let domains = vec![domain, domain];
+
+    let (ordinary_commitment, _) =
+        <_ as Pcs<Challenge, ConfigChallenger>>::commit(pcs, ordinary_inputs)
+            .expect("valid ordinary main commitment must succeed");
+    let (guarded_commitment, guarded_data) =
+        commit_main_traces_secret::<SecretConfig>(pcs, &domains, &guarded_traces)
+            .expect("valid guarded main commitment must succeed");
+
+    assert_eq!(guarded_commitment, ordinary_commitment);
+    assert_eq!(guarded_traces[0].values, first_values);
+    assert_eq!(guarded_traces[1].values, second_values);
+    drop(guarded_data);
+}
+
+#[cfg(feature = "secret-memory")]
+#[test]
+fn guarded_batch_main_commitment_rejects_batch_shape_mismatch() {
+    use p3_commit::{Pcs, SecretProverData};
+
+    const TRACE_SIZE: usize = 16;
+
+    let config = make_secret_config(0x4d41_494e_5f45_5252);
+    let pcs = config.pcs();
+    type ConfigChallenger = <SecretConfig as StarkGenericConfig>::Challenger;
+    let domain =
+        <_ as Pcs<Challenge, ConfigChallenger>>::natural_domain_for_degree(pcs, TRACE_SIZE);
+    let (_, trace, _) = create_mul_instance(4, 2);
+    let trace_values = trace.values.clone();
+    let guarded_traces = vec![SecretProverData::new(trace)];
+
+    let result = commit_main_traces_secret::<SecretConfig>(pcs, &[domain, domain], &guarded_traces);
+
+    assert!(matches!(
+        result,
+        Err(SecretMainTraceCommitError::InputCountMismatch)
+    ));
+    assert_eq!(guarded_traces[0].values, trace_values);
+}
+
+#[cfg(feature = "secret-memory")]
+#[test]
+fn guarded_batch_main_commitment_rejects_empty_and_malformed_sources() {
+    use p3_commit::{Pcs, SecretProverData};
+
+    const TRACE_SIZE: usize = 16;
+
+    let config = make_secret_config(0x4d41_494e_5f42_4144);
+    let pcs = config.pcs();
+    type ConfigChallenger = <SecretConfig as StarkGenericConfig>::Challenger;
+    let domain =
+        <_ as Pcs<Challenge, ConfigChallenger>>::natural_domain_for_degree(pcs, TRACE_SIZE);
+
+    let empty_traces = Vec::new();
+    let empty_domains = Vec::new();
+    let empty_result =
+        commit_main_traces_secret::<SecretConfig>(pcs, &empty_domains, &empty_traces);
+    assert!(matches!(
+        empty_result,
+        Err(SecretMainTraceCommitError::EmptyBatch)
+    ));
+
+    let mut malformed = RowMajorMatrix::new(
+        [Val::ONE, Val::TWO, Val::from_u64(3), Val::from_u64(4)].to_vec(),
+        2,
+    );
+    malformed.width = 3;
+    let guarded_traces = vec![SecretProverData::new(malformed)];
+    let malformed_result =
+        commit_main_traces_secret::<SecretConfig>(pcs, &[domain], &guarded_traces);
+    assert!(matches!(
+        malformed_result,
+        Err(SecretMainTraceCommitError::Matrix(
+            p3_matrix::secret::SecretMatrixError::InvalidShape
+        ))
+    ));
+    assert_eq!(
+        guarded_traces[0].values,
+        [Val::ONE, Val::TWO, Val::from_u64(3), Val::from_u64(4)]
+    );
+    assert_eq!(guarded_traces[0].width, 3);
+}
+
+#[cfg(feature = "secret-memory")]
+#[test]
+fn guarded_lookup_generation_flattens_and_commits_with_ordinary_parity() {
+    use p3_commit::{Pcs, SecretProverData};
+    use p3_lookup::Lookups;
+
+    const TRACE_SIZE: usize = 16;
+
+    let config = make_secret_config(0x5045_524d_5f47_5541);
+    let pcs = config.pcs();
+    type ConfigChallenger = <SecretConfig as StarkGenericConfig>::Challenger;
+    let domain =
+        <_ as Pcs<Challenge, ConfigChallenger>>::natural_domain_for_degree(pcs, TRACE_SIZE);
+    let air = MulAirLookups::new(MulAir { reps: 2 }, true, false, Vec::new());
+    let main = mul_trace::<Val>(TRACE_SIZE, 2);
+    let lookups: Lookups<Val> = Lookups::from_air::<Challenge, _>(&air)
+        .expect("valid multiplication AIR must define bounded lookups");
+    let mut challenges = Vec::new();
+    for index in 0..lookups.len() {
+        let challenge_offset = u64::try_from(index)
+            .expect("bounded lookup index must fit")
+            .checked_add(7)
+            .expect("bounded lookup challenge must fit");
+        challenges.push(Challenge::new([
+            Val::from_u64(challenge_offset),
+            Val::ONE,
+            Val::ZERO,
+            Val::ZERO,
+        ]));
+        challenges.push(Challenge::from(Val::from_u64(11)));
+    }
+    let gadget = LogUpGadget::new();
+
+    let (ordinary_trace, ordinary_terminal) = gadget.generate_permutation::<Val, Challenge>(
+        &main,
+        &None,
+        &[],
+        &[],
+        &lookups,
+        &challenges,
+    );
+    let ordinary_flattened = ordinary_trace.flatten_to_base();
+    let (ordinary_commitment, _) =
+        <_ as Pcs<Challenge, ConfigChallenger>>::commit(pcs, [(domain, ordinary_flattened)])
+            .expect("valid ordinary permutation commitment must succeed");
+
+    let (guarded_trace, guarded_terminal) = gadget
+        .generate_permutation_secret::<Val, Challenge>(
+            &main,
+            &None,
+            &[],
+            &[],
+            &lookups,
+            &challenges,
+        )
+        .expect("valid lookup witness must generate a guarded permutation trace");
+    let guarded_trace = guarded_trace.expect("lookups must produce a guarded trace");
+    let (guarded_commitment, guarded_data) =
+        commit_permutation_traces_secret::<SecretConfig>(pcs, vec![(domain, guarded_trace)])
+            .expect("valid guarded permutation commitment must succeed");
+
+    assert_eq!(guarded_commitment, ordinary_commitment);
+    assert_eq!(
+        guarded_terminal.expect("lookups must produce a terminal").0,
+        ordinary_terminal
+            .expect("ordinary lookups must produce a terminal")
+            .0
+    );
+    drop(guarded_data);
+
+    let empty = commit_permutation_traces_secret::<SecretConfig>(
+        pcs,
+        Vec::<(_, SecretProverData<RowMajorMatrix<Challenge>>)>::new(),
+    );
+    assert!(matches!(
+        empty,
+        Err(p3_batch_stark::prover::SecretPermutationCommitError::EmptyBatch)
+    ));
+}
+
+#[cfg(feature = "secret-memory")]
+#[test]
+fn guarded_quotient_rejects_shape_drift_before_allocating_secret_output() {
+    use p3_commit::{Pcs, PolynomialSpace, UnivariateStarkPcs};
+
+    const TRACE_SIZE: usize = 16;
+    const QUOTIENT_SIZE: usize = 32;
+
+    let config = make_config(0x5348_4150_455f_4552);
+    let (air, trace, public_values) = create_mul_instance(4, 2);
+    let pcs = config.pcs();
+    type ConfigChallenger = <MyConfig as StarkGenericConfig>::Challenger;
+    let trace_domain =
+        <_ as Pcs<Challenge, ConfigChallenger>>::natural_domain_for_degree(pcs, TRACE_SIZE);
+    let quotient_domain = trace_domain.create_disjoint_domain(QUOTIENT_SIZE);
+    let (_, trace_data) =
+        <_ as Pcs<Challenge, ConfigChallenger>>::commit(pcs, [(trace_domain, trace)])
+            .expect("valid trace commitment must succeed");
+    let trace_on_quotient_domain =
+        <_ as UnivariateStarkPcs<Challenge, ConfigChallenger>>::get_evaluations_on_domain(
+            pcs,
+            &trace_data,
+            0,
+            quotient_domain,
+        );
+    let invalid_layout = AirLayout {
+        main_width: <DemoAir as BaseAir<Val>>::width(&air)
+            .checked_add(1)
+            .expect("test width increment must fit"),
+        num_public_values: public_values.len(),
+        ..Default::default()
+    };
+
+    let result = quotient_values_secret::<MyConfig, _, _, _>(
+        pcs,
+        &air,
+        &public_values,
+        invalid_layout,
+        trace_domain,
+        quotient_domain,
+        &trace_on_quotient_domain,
+        None,
+        &[],
+        &[],
+        &LogUpGadget::new(),
+        &[],
+        None,
+        Challenge::ONE,
+    );
+
+    assert!(matches!(result, Err(SecretQuotientError::InvalidShape)));
+}
+
 #[test]
 fn test_two_instances() -> Result<(), impl Debug> {
     let config = make_config(1337);
@@ -669,6 +1530,235 @@ fn test_two_instances() -> Result<(), impl Debug> {
     let airs = vec![air_fib, air_mul];
     let pvs = vec![fib_pis, mul_pis];
     verify_batch(&config, &airs, &proof, &pvs, common)
+}
+
+#[cfg(feature = "secret-memory")]
+#[test]
+fn guarded_batch_prover_matches_ordinary_proof_and_verifies() {
+    const SEED: u64 = 0x4755_4152_4445_4450;
+
+    let config = make_secret_config(SEED);
+    let (fibonacci_air, fibonacci_trace, fibonacci_public_values) = create_fib_instance(4);
+    let (multiplication_air, multiplication_trace, multiplication_public_values) =
+        create_mul_instance(4, 2);
+
+    let ordinary_fibonacci_trace = fibonacci_trace.clone();
+    let ordinary_multiplication_trace = multiplication_trace.clone();
+    let ordinary_instances = vec![
+        StarkInstance {
+            air: &fibonacci_air,
+            trace: &ordinary_fibonacci_trace,
+            public_values: fibonacci_public_values.clone(),
+        },
+        StarkInstance {
+            air: &multiplication_air,
+            trace: &ordinary_multiplication_trace,
+            public_values: multiplication_public_values.clone(),
+        },
+    ];
+    let prover_data = ProverData::from_instances(&config, &ordinary_instances)
+        .expect("valid ordinary proving data must be constructed");
+    let ordinary_proof = prove_batch(&config, &ordinary_instances, &prover_data)
+        .expect("valid ordinary batch must prove");
+
+    let guarded_instances = vec![
+        GuardedStarkInstance {
+            air: &fibonacci_air,
+            trace: SecretProverData::new(fibonacci_trace),
+            public_values: fibonacci_public_values.clone(),
+        },
+        GuardedStarkInstance {
+            air: &multiplication_air,
+            trace: SecretProverData::new(multiplication_trace),
+            public_values: multiplication_public_values.clone(),
+        },
+    ];
+    let mut observer = RecordingSecretBatchObserver::default();
+    let guarded_proof =
+        prove_batch_secret_with_observer(&config, guarded_instances, &prover_data, &mut observer)
+            .expect("valid guarded batch must prove");
+    let expected_started_phases = vec![
+        SecretBatchProvingPhase::Preparation,
+        SecretBatchProvingPhase::MainCommitment,
+        SecretBatchProvingPhase::LookupGeneration,
+        SecretBatchProvingPhase::PermutationCommitment,
+        SecretBatchProvingPhase::QuotientCommitment,
+        SecretBatchProvingPhase::QuotientEvaluation { instance_index: 0 },
+        SecretBatchProvingPhase::QuotientEvaluation { instance_index: 1 },
+        SecretBatchProvingPhase::RandomizationCommitment,
+        SecretBatchProvingPhase::Opening,
+        SecretBatchProvingPhase::ProofAssembly,
+    ];
+    let expected_completed_phases = vec![
+        SecretBatchProvingPhase::Preparation,
+        SecretBatchProvingPhase::MainCommitment,
+        SecretBatchProvingPhase::LookupGeneration,
+        SecretBatchProvingPhase::PermutationCommitment,
+        SecretBatchProvingPhase::QuotientEvaluation { instance_index: 0 },
+        SecretBatchProvingPhase::QuotientEvaluation { instance_index: 1 },
+        SecretBatchProvingPhase::QuotientCommitment,
+        SecretBatchProvingPhase::RandomizationCommitment,
+        SecretBatchProvingPhase::Opening,
+        SecretBatchProvingPhase::ProofAssembly,
+    ];
+    assert_eq!(observer.started, expected_started_phases);
+    assert_eq!(observer.completed, expected_completed_phases);
+
+    let ordinary_bytes =
+        postcard::to_allocvec(&ordinary_proof).expect("ordinary proof must serialize");
+    let guarded_bytes =
+        postcard::to_allocvec(&guarded_proof).expect("guarded proof must serialize");
+    assert_eq!(guarded_bytes, ordinary_bytes);
+
+    verify_batch(
+        &config,
+        &[fibonacci_air, multiplication_air],
+        &guarded_proof,
+        &[fibonacci_public_values, multiplication_public_values],
+        &prover_data.common,
+    )
+    .expect("the ordinary verifier must accept the guarded proof");
+}
+
+#[cfg(feature = "secret-memory")]
+#[test]
+fn guarded_batch_prover_rejects_empty_batch_without_starting_a_transcript() {
+    let config = make_secret_config(0x454d_5054_5942_4154);
+    let prover_data = ProverData::empty(0);
+    let instances: Vec<GuardedStarkInstance<'_, SecretConfig, DemoAir>> = Vec::new();
+
+    let result = prove_batch_secret(&config, instances, &prover_data);
+
+    assert!(matches!(result, Err(SecretBatchProvingError::EmptyBatch)));
+}
+
+#[cfg(feature = "secret-memory")]
+#[test]
+fn guarded_batch_observer_does_not_report_completion_after_preflight_failure() {
+    let config = make_secret_config(0x4f42_5345_5256_4552);
+    let prover_data = ProverData::empty(0);
+    let instances: Vec<GuardedStarkInstance<'_, SecretConfig, DemoAir>> = Vec::new();
+    let mut observer = RecordingSecretBatchObserver::default();
+
+    let result = prove_batch_secret_with_observer(&config, instances, &prover_data, &mut observer);
+
+    assert!(matches!(result, Err(SecretBatchProvingError::EmptyBatch)));
+    assert_eq!(observer.started, vec![SecretBatchProvingPhase::Preparation]);
+    assert!(observer.completed.is_empty());
+}
+
+#[cfg(feature = "secret-memory")]
+#[test]
+fn guarded_batch_prover_rejects_public_value_count_mismatch() {
+    let config = make_secret_config(0x5055_424c_4943_5641);
+    let (air, trace, public_values) = create_mul_instance(4, 2);
+    assert!(public_values.is_empty());
+    let prover_data = ProverData::empty(1);
+    let instances = vec![GuardedStarkInstance {
+        air: &air,
+        trace: SecretProverData::new(trace),
+        public_values: vec![Val::ONE],
+    }];
+
+    let result = prove_batch_secret(&config, instances, &prover_data);
+
+    assert!(matches!(
+        result,
+        Err(SecretBatchProvingError::PublicValueCountMismatch)
+    ));
+}
+
+#[cfg(feature = "secret-memory")]
+#[test]
+fn guarded_batch_prover_composes_preprocessing_and_lookup_permutations() {
+    const LOG_HEIGHT: usize = 5;
+    const REPETITIONS: usize = 2;
+    const SEED: u64 = 0x4c4f_4f4b_5550_5a4b;
+
+    let config = make_secret_config(SEED);
+    let multiplication_air = DemoAirWithLookups::MulLookups(MulAirLookups::new(
+        MulAir { reps: REPETITIONS },
+        false,
+        true,
+        vec!["MulFib".to_string(), "MulFib".to_string()],
+    ));
+    let fibonacci_air = DemoAirWithLookups::FibLookups(FibAirLookups::new(
+        FibonacciAir {
+            log_height: LOG_HEIGHT,
+            tamper_index: None,
+        },
+        true,
+        None,
+    ));
+    let trace_height = 1_usize << LOG_HEIGHT;
+    let multiplication_trace = mul_trace::<Val>(trace_height, REPETITIONS);
+    let fibonacci_trace = fib_trace::<Val>(0, 1, trace_height);
+    let fibonacci_public_values = vec![
+        Val::from_u64(0),
+        Val::from_u64(1),
+        Val::from_u64(fib_n(trace_height)),
+    ];
+
+    let ordinary_multiplication_trace = multiplication_trace.clone();
+    let ordinary_fibonacci_trace = fibonacci_trace.clone();
+    let ordinary_instances = vec![
+        StarkInstance {
+            air: &multiplication_air,
+            trace: &ordinary_multiplication_trace,
+            public_values: vec![],
+        },
+        StarkInstance {
+            air: &fibonacci_air,
+            trace: &ordinary_fibonacci_trace,
+            public_values: fibonacci_public_values.clone(),
+        },
+    ];
+    let prover_data = ProverData::from_instances(&config, &ordinary_instances)
+        .expect("valid lookup proving data must be constructed");
+    let ordinary_proof = prove_batch(&config, &ordinary_instances, &prover_data)
+        .expect("valid ordinary lookup batch must prove");
+
+    let guarded_instances = vec![
+        GuardedStarkInstance {
+            air: &multiplication_air,
+            trace: SecretProverData::new(multiplication_trace),
+            public_values: vec![],
+        },
+        GuardedStarkInstance {
+            air: &fibonacci_air,
+            trace: SecretProverData::new(fibonacci_trace),
+            public_values: fibonacci_public_values.clone(),
+        },
+    ];
+    let guarded_proof = prove_batch_secret(&config, guarded_instances, &prover_data)
+        .expect("valid guarded lookup batch must prove");
+
+    assert_eq!(
+        guarded_proof.commitments.main,
+        ordinary_proof.commitments.main
+    );
+    assert_eq!(
+        guarded_proof.commitments.permutation,
+        ordinary_proof.commitments.permutation
+    );
+    assert_eq!(
+        guarded_proof.commitments.quotient_chunks,
+        ordinary_proof.commitments.quotient_chunks
+    );
+    assert_eq!(
+        postcard::to_allocvec(&guarded_proof.opened_values)
+            .expect("guarded lookup openings must serialize"),
+        postcard::to_allocvec(&ordinary_proof.opened_values)
+            .expect("ordinary lookup openings must serialize"),
+    );
+    verify_batch(
+        &config,
+        &[multiplication_air, fibonacci_air],
+        &guarded_proof,
+        &[vec![], fibonacci_public_values],
+        &prover_data.common,
+    )
+    .expect("the ordinary verifier must accept the guarded lookup proof");
 }
 
 /// Showcases `p3-security`: prove a real batch sharing a LogUp bus, then

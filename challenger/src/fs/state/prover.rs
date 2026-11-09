@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Prover-side driver.
 
 use alloc::vec::Vec;
@@ -111,6 +115,16 @@ impl<C, U: Unit> ProverState<C, U> {
     /// This does not restore the underlying challenger or yield a partial proof.
     pub fn abort(&mut self) {
         self.player.abort();
+    }
+
+    /// Number of described transcript interactions not yet replayed.
+    ///
+    /// Fallible protocol drivers use this before finalization so an ordinary
+    /// error can abort an incomplete transcript instead of reaching the
+    /// player's panic-based programmer-bug check during unwinding.
+    #[must_use]
+    pub fn remaining_interactions(&self) -> usize {
+        self.player.remaining()
     }
 
     /// Finalise the driver and return the serialised wire bytes.

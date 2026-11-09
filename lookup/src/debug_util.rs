@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Debug helpers to inspect lookup witnesses.
 //!
 //! They recompute every lookup tuple from the raw traces and assert that the
@@ -175,10 +179,10 @@ fn accumulate_lookup<F: Field>(
         };
 
         // Each periodic column repeats with its own period.
-        let periodic_row: Vec<F> = instance
+        let periodic_values: Vec<F> = instance
             .periodic_columns
             .iter()
-            .map(|col| col[row % col.len()])
+            .map(|column| column[row % column.len()])
             .collect();
 
         let builder = MiniLookupBuilder {
@@ -187,8 +191,8 @@ fn accumulate_lookup<F: Field>(
                 preprocessed_rows.top.values,
                 preprocessed_rows.bottom.values,
             ),
+            periodic_values: &periodic_values,
             public_values: instance.public_values,
-            periodic_values: &periodic_row,
             permutation_challenges: instance.permutation_challenges,
             row,
             height,
@@ -227,8 +231,8 @@ fn accumulate_lookup<F: Field>(
 struct MiniLookupBuilder<'a, F: Field> {
     main: VerticalPair<RowMajorMatrixView<'a, F>, RowMajorMatrixView<'a, F>>,
     preprocessed: RowWindow<'a, F>,
-    public_values: &'a [F],
     periodic_values: &'a [F],
+    public_values: &'a [F],
     permutation_challenges: &'a [F],
     row: usize,
     height: usize,

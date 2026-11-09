@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use core::marker::PhantomData;
 use core::{array, iter};
 
@@ -101,6 +105,16 @@ pub struct ExtField<F, const D: usize, Shape, A = F> {
     _phantom: PhantomData<(F, Shape)>,
 }
 
+#[cfg(feature = "secret-memory")]
+impl<F, const D: usize, Shape, A> zeroize::Zeroize for ExtField<F, D, Shape, A>
+where
+    A: zeroize::Zeroize,
+{
+    fn zeroize(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.value);
+    }
+}
+
 impl<F, const D: usize, Shape, A> ExtField<F, D, Shape, A> {
     /// Create an extension field element from an array of base/algebra elements.
     ///
@@ -117,6 +131,21 @@ impl<F, const D: usize, Shape, A> ExtField<F, D, Shape, A> {
             value,
             _phantom: PhantomData,
         }
+    }
+}
+
+#[cfg(all(test, feature = "secret-memory"))]
+mod secret_memory_tests {
+    use super::{CubicTrinomial, ExtField};
+
+    #[test]
+    fn extension_coefficients_are_zeroized() {
+        let mut value =
+            ExtField::<(), 3, CubicTrinomial, u32>::new([0xdead_beef, 0x5245_414c, 0x4c59_4d45]);
+
+        zeroize::Zeroize::zeroize(&mut value);
+
+        assert_eq!(value.value, [0_u32; 3]);
     }
 }
 
@@ -144,6 +173,17 @@ pub struct PackedExtField<F: Field, PF: PackedField<Scalar = F>, const D: usize,
     )]
     pub(crate) value: [PF; D],
     _phantom: PhantomData<Shape>,
+}
+
+#[cfg(feature = "secret-memory")]
+impl<F, PF, const D: usize, Shape> zeroize::Zeroize for PackedExtField<F, PF, D, Shape>
+where
+    F: Field,
+    PF: PackedField<Scalar = F> + zeroize::Zeroize,
+{
+    fn zeroize(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.value);
+    }
 }
 
 impl<F: Field, PF: PackedField<Scalar = F>, const D: usize, Shape> PackedExtField<F, PF, D, Shape> {

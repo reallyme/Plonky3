@@ -1,3 +1,7 @@
+<!-- Modified by ReallyMe Technologies Limited, 2026. -->
+<!-- SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited -->
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+
 # Changelog
 
 All notable changes to this project will be documented in this file.
@@ -6,6 +10,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- Add opt-in guarded two-adic forward, inverse, coset-inverse, and coset-LDE capabilities for
+  secret-derived matrices.
+- Add guarded compact coefficient retention and exact reconstruction of selected bit-reversed
+  coset-LDE rows.
+- Add complete bit-reversed coset-LDE reconstruction from retained coefficients under a
+  zeroizing owner, enabling matrix-at-a-time PCS reduction after committed leaves are erased.
+
+### Changed
+- Build guarded coefficient-retaining coset LDEs in a dedicated final-size allocation and return
+  the original compact allocation as the coefficient owner, avoiding a redundant compact secret
+  copy and grow/reallocation overlap.
+
 ## [0.8.0] - 2026-09-23
 ### Merged PRs
 - Perf(dft,matrix): optimize inverse DFT and matrix hot paths (#2113)
@@ -70,4 +87,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Jeremi Do Dinh
 - Sebastian
 - Thomas Coratger
-

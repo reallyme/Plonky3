@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -20,6 +24,8 @@ use crate::builder::InteractionBuilder;
 use crate::count::Count;
 use crate::logup::LogUpGadget;
 use crate::protocol::LookupProtocol;
+#[cfg(feature = "secret-memory")]
+use crate::secret::SecretLookupGenerationError;
 use crate::types::{Kind, Lookup, LookupError, LookupTerminal};
 
 /// Base field used in every test.
@@ -529,6 +535,326 @@ fn generate_permutation_balances_to_zero_terminal() {
     // A balanced range check yields a zero terminal with overwhelming probability.
     let terminal = terminal.expect("AIR has lookups -> terminal must be present");
     assert_eq!(terminal.0, EF::ZERO);
+}
+
+#[test]
+fn generate_permutation_resolves_periodic_lookup_elements() {
+    let height = 4;
+    let symbolic = SymbolicAirBuilder::<F>::new(AirLayout {
+        main_width: 1,
+        num_periodic_columns: 1,
+        ..Default::default()
+    });
+    let periodic = symbolic.periodic_values()[0];
+    let multiplicity = symbolic.main().current_slice()[0];
+    let lookups = vec![Lookup {
+        kind: Kind::Local,
+        elements: vec![vec![periodic.into()]],
+        multiplicities: vec![multiplicity.into()],
+        count_weight: 0,
+        column: 0,
+        flags: None,
+    }];
+
+    let main = RowMajorMatrix::new(vec![F::ONE; height], 1);
+    let periodic_columns = vec![vec![F::from_u32(3), F::from_u32(5)]];
+    let alpha = EF::new([F::from_u32(7), F::ONE, F::ZERO, F::ZERO]);
+    let challenges = vec![alpha, EF::from_u32(11)];
+
+    let (aux, terminal) = LogUpGadget::new().generate_permutation::<F, EF>(
+        &main,
+        &None,
+        &periodic_columns,
+        &[],
+        &lookups,
+        &challenges,
+    );
+
+    let mut expected_terminal = EF::ZERO;
+    for row in 0..height {
+        let periodic_value = periodic_columns[0][row % periodic_columns[0].len()];
+        let expected_fraction = (alpha - periodic_value).inverse();
+        assert_eq!(aux.row_slice(row).unwrap()[1], expected_fraction);
+        expected_terminal += expected_fraction;
+    }
+    assert_eq!(terminal.unwrap().0, expected_terminal);
+}
+
+#[cfg(feature = "secret-memory")]
+#[test]
+fn guarded_permutation_matches_ordinary_across_multiple_inversion_chunks() {
+    const HEIGHT: usize = 2048;
+
+    let mut rng = SmallRng::seed_from_u64(0x4755_4152_4445_4450);
+    let main = balanced_range_check_main(HEIGHT, &mut rng);
+    let lookups: Lookups<F> = Lookups::from_air::<EF, _>(&RangeCheckAir::new())
+        .expect("valid range-check AIR must define bounded lookups");
+    let challenges = vec![
+        EF::new([F::from_u32(7), F::ONE, F::ZERO, F::ZERO]),
+        EF::from_u32(11),
+    ];
+    let gadget = LogUpGadget::new();
+
+    let (ordinary, ordinary_terminal) =
+        gadget.generate_permutation::<F, EF>(&main, &None, &[], &[], &lookups, &challenges);
+    let (guarded, guarded_terminal) = gadget
+        .generate_permutation_secret::<F, EF>(&main, &None, &[], &[], &lookups, &challenges)
+        .expect("valid lookup witness must generate a guarded permutation trace");
+    let guarded = guarded.expect("a nonempty lookup set must produce a guarded trace");
+
+    assert_eq!(guarded.width, ordinary.width);
+    assert_eq!(guarded.values, ordinary.values);
+    assert_eq!(
+        guarded_terminal
+            .expect("a nonempty lookup set must produce a terminal")
+            .0,
+        ordinary_terminal
+            .expect("ordinary generation must produce a terminal")
+            .0
+    );
+}
+
+#[cfg(feature = "secret-memory")]
+#[test]
+fn guarded_permutation_matches_periodic_ordinary_trace_and_erases_explicitly() {
+    let height = 4;
+    let symbolic = SymbolicAirBuilder::<F>::new(AirLayout {
+        main_width: 1,
+        num_periodic_columns: 1,
+        ..Default::default()
+    });
+    let lookup = Lookup {
+        kind: Kind::Local,
+        elements: vec![vec![symbolic.periodic_values()[0].into()]],
+        multiplicities: vec![symbolic.main().current_slice()[0].into()],
+        count_weight: 0,
+        column: 0,
+        flags: None,
+    };
+    let lookups = vec![lookup];
+    let main = RowMajorMatrix::new(vec![F::ONE; height], 1);
+    let periodic_columns = vec![vec![F::from_u32(3), F::from_u32(5)]];
+    let challenges = vec![
+        EF::new([F::from_u32(7), F::ONE, F::ZERO, F::ZERO]),
+        EF::from_u32(11),
+    ];
+    let gadget = LogUpGadget::new();
+
+    let (ordinary, ordinary_terminal) = gadget.generate_permutation::<F, EF>(
+        &main,
+        &None,
+        &periodic_columns,
+        &[],
+        &lookups,
+        &challenges,
+    );
+    let (guarded, guarded_terminal) = gadget
+        .generate_permutation_secret::<F, EF>(
+            &main,
+            &None,
+            &periodic_columns,
+            &[],
+            &lookups,
+            &challenges,
+        )
+        .expect("valid periodic lookup witness must generate a guarded trace");
+    let mut guarded = guarded.expect("a nonempty lookup set must produce a guarded trace");
+
+    assert_eq!(guarded.values, ordinary.values);
+    assert_eq!(
+        guarded_terminal
+            .expect("a nonempty lookup set must produce a terminal")
+            .0,
+        ordinary_terminal
+            .expect("ordinary generation must produce a terminal")
+            .0
+    );
+
+    zeroize::Zeroize::zeroize(&mut guarded);
+    assert_eq!(guarded.values, vec![EF::ZERO; height * 2]);
+    assert_eq!(guarded.width, 0);
+}
+
+#[cfg(feature = "secret-memory")]
+#[test]
+fn guarded_permutation_returns_typed_input_and_challenge_errors() {
+    let mut rng = SmallRng::seed_from_u64(0x4755_4152_445f_4552);
+    let main = balanced_range_check_main(8, &mut rng);
+    let lookups: Lookups<F> = Lookups::from_air::<EF, _>(&RangeCheckAir::new())
+        .expect("valid range-check AIR must define bounded lookups");
+    let gadget = LogUpGadget::new();
+    let challenges = vec![EF::from_u32(7), EF::from_u32(11)];
+
+    let challenge_result = gadget.generate_permutation_secret::<F, EF>(
+        &main,
+        &None,
+        &[],
+        &[],
+        &lookups,
+        &challenges[..1],
+    );
+    assert!(matches!(
+        challenge_result,
+        Err(SecretLookupGenerationError::ChallengeCountMismatch)
+    ));
+
+    let periodic_result = gadget.generate_permutation_secret::<F, EF>(
+        &main,
+        &None,
+        &[Vec::new()],
+        &[],
+        &lookups,
+        &challenges,
+    );
+    assert!(matches!(
+        periodic_result,
+        Err(SecretLookupGenerationError::EmptyPeriodicColumn)
+    ));
+
+    let mut malformed = main;
+    malformed.width = malformed
+        .width
+        .checked_add(2)
+        .expect("bounded test width must fit");
+    let shape_result = gadget.generate_permutation_secret::<F, EF>(
+        &malformed,
+        &None,
+        &[],
+        &[],
+        &lookups,
+        &challenges,
+    );
+    assert!(matches!(
+        shape_result,
+        Err(SecretLookupGenerationError::InvalidMainShape)
+    ));
+}
+
+#[cfg(feature = "secret-memory")]
+#[test]
+fn guarded_permutation_reports_witness_failures_without_panicking() {
+    let gadget = LogUpGadget::new();
+    let challenges = vec![EF::from_u32(17), EF::from_u32(11)];
+    let exclusive = exclusive_two_branch_lookup();
+    let non_boolean = RowMajorMatrix::new(
+        vec![F::from_u32(2), F::from_u32(5), F::ZERO, F::from_u32(9)],
+        4,
+    );
+    let non_boolean_result = gadget.generate_permutation_secret::<F, EF>(
+        &non_boolean,
+        &None,
+        &[],
+        &[],
+        &exclusive,
+        &challenges,
+    );
+    assert!(matches!(
+        non_boolean_result,
+        Err(SecretLookupGenerationError::NonBooleanExclusiveFlag)
+    ));
+
+    let two_active = RowMajorMatrix::new(vec![F::ONE, F::from_u32(5), F::ONE, F::from_u32(9)], 4);
+    let two_active_result = gadget.generate_permutation_secret::<F, EF>(
+        &two_active,
+        &None,
+        &[],
+        &[],
+        &exclusive,
+        &challenges,
+    );
+    assert!(matches!(
+        two_active_result,
+        Err(SecretLookupGenerationError::MultipleActiveExclusiveFlags)
+    ));
+
+    let symbolic = SymbolicAirBuilder::<F>::new(AirLayout {
+        main_width: 1,
+        ..Default::default()
+    });
+    let zero_lookup = vec![Lookup {
+        kind: Kind::Local,
+        elements: vec![vec![symbolic.main().current_slice()[0].into()]],
+        multiplicities: vec![SymbolicExpression::from(F::ONE)],
+        count_weight: 1,
+        column: 0,
+        flags: None,
+    }];
+    let collision_value = F::from_u32(23);
+    let zero_main = RowMajorMatrix::new(vec![collision_value], 1);
+    let zero_challenges = vec![EF::from(collision_value), EF::from_u32(11)];
+    let zero_result = gadget.generate_permutation_secret::<F, EF>(
+        &zero_main,
+        &None,
+        &[],
+        &[],
+        &zero_lookup,
+        &zero_challenges,
+    );
+    assert!(matches!(
+        zero_result,
+        Err(SecretLookupGenerationError::ZeroDenominator)
+    ));
+}
+
+#[cfg(feature = "secret-memory")]
+#[test]
+fn guarded_permutation_skips_allocation_for_no_lookups() {
+    let result = LogUpGadget::new()
+        .generate_permutation_secret::<F, EF>(
+            &RowMajorMatrix::new(vec![F::ONE], 1),
+            &None,
+            &[],
+            &[],
+            &[],
+            &[],
+        )
+        .expect("an AIR without lookups must be a valid empty permutation phase");
+
+    assert!(result.0.is_none());
+    assert!(result.1.is_none());
+}
+
+#[test]
+fn debug_lookup_replay_resolves_periodic_elements() {
+    use crate::debug_util::{LookupDebugInstance, check_lookups};
+
+    let symbolic = SymbolicAirBuilder::<F>::new(AirLayout {
+        main_width: 1,
+        num_periodic_columns: 1,
+        ..Default::default()
+    });
+    let periodic = symbolic.periodic_values()[0];
+    let lookup = |multiplicity: F| Lookup {
+        kind: Kind::Global("periodic-debug".to_string()),
+        elements: vec![vec![periodic.into()]],
+        multiplicities: vec![multiplicity.into()],
+        count_weight: 0,
+        column: 0,
+        flags: None,
+    };
+    let query = lookup(F::ONE);
+    let table = lookup(-F::ONE);
+    let main = RowMajorMatrix::new(vec![F::ZERO; 4], 1);
+    let periodic_columns = vec![vec![F::from_u32(3), F::from_u32(5)]];
+
+    let query_instance = LookupDebugInstance {
+        main_trace: &main,
+        preprocessed_trace: &None,
+        public_values: &[],
+        periodic_columns: &periodic_columns,
+        lookups: core::slice::from_ref(&query),
+        permutation_challenges: &[],
+    };
+    let table_instance = LookupDebugInstance {
+        main_trace: &main,
+        preprocessed_trace: &None,
+        public_values: &[],
+        periodic_columns: &periodic_columns,
+        lookups: core::slice::from_ref(&table),
+        permutation_challenges: &[],
+    };
+
+    check_lookups(&[query_instance, table_instance]);
 }
 
 #[test]

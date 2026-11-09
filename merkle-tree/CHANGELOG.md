@@ -1,3 +1,7 @@
+<!-- Modified by ReallyMe Technologies Limited, 2026. -->
+<!-- SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited -->
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+
 # Changelog
 
 All notable changes to this project will be documented in this file.
@@ -6,6 +10,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+- Add an exact-root incremental Merkle builder for zeroizing hash states.
+### Added
+- Add guarded Merkle and hiding-Merkle commitment paths with typed failure handling.
+- Add a guarded transition from retained Merkle leaf matrices to public
+  authentication data, plus typed single-query and pruned multi-query opening
+  APIs for independently recomputed matrices. This lets secret prover paths
+  erase bulky committed matrices before later query construction without
+  changing commitments or proof wire formats.
+- Add the corresponding hiding-Merkle transition. Salt matrices remain under
+  zeroizing, non-cloneable ownership while value matrices are erased, and only
+  verifier-selected salt rows are released when recomputed rows are opened.
+- Implement the generic recomputable-MMCS contract for ordinary and hiding
+  Merkle commitments without changing either proof format.
+- Add a fallible dimension-only Merkle arity planner with checked geometry and
+  allocation errors, and use it as the verifier's canonical schedule source.
+  Randomized binary and 4-ary tests require exact equality with schedules
+  produced by the existing commitment constructor.
+- Specialize guarded detached commitments with a consuming Merkle builder.
+  Value matrices are erased and released immediately after their height group
+  is hashed; hiding commitments retain only separately owned salt matrices.
+  Commitments, cap behavior, authentication paths, salt order, RNG order, and
+  proof wire formats remain identical to the ordinary builder.
+
 ## [0.8.0] - 2026-09-23
 ### Merged PRs
 - Refactor(merkle-tree): make the opening shape check self-contained (#2026)
@@ -81,4 +108,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - AngusG
 - Sai
 - Thomas Coratger
-

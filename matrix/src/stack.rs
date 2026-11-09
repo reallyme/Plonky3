@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use alloc::vec::Vec;
 use core::ops::Deref;
 
@@ -56,6 +60,30 @@ pub struct HorizontalPair<Left, Right> {
     pub left: Left,
     /// The right matrix in the horizontal composition.
     pub right: Right,
+}
+
+#[cfg(feature = "secret-memory")]
+impl<Top, Bottom> zeroize::Zeroize for VerticalPair<Top, Bottom>
+where
+    Top: zeroize::Zeroize,
+    Bottom: zeroize::Zeroize,
+{
+    fn zeroize(&mut self) {
+        self.top.zeroize();
+        self.bottom.zeroize();
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<Left, Right> zeroize::Zeroize for HorizontalPair<Left, Right>
+where
+    Left: zeroize::Zeroize,
+    Right: zeroize::Zeroize,
+{
+    fn zeroize(&mut self) {
+        self.left.zeroize();
+        self.right.zeroize();
+    }
 }
 
 impl<Top, Bottom> VerticalPair<Top, Bottom> {

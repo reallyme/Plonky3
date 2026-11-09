@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use alloc::vec::Vec;
 use core::arch::x86_64::{self, __m256i};
 use core::array;
@@ -37,6 +41,13 @@ pub trait MontyParametersAVX2 {
 #[repr(transparent)] // This is needed to make `transmute`s safe.
 #[must_use]
 pub struct PackedMontyField31AVX2<PMP: PackedMontyParameters>(pub [MontyField31<PMP>; WIDTH]);
+
+#[cfg(feature = "secret-memory")]
+impl<PMP: PackedMontyParameters> zeroize::Zeroize for PackedMontyField31AVX2<PMP> {
+    fn zeroize(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
 
 impl<PMP: PackedMontyParameters> PackedMontyField31AVX2<PMP> {
     #[inline]

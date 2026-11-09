@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Merkle path pruning: minimal multi-opening proofs via a level-by-level frontier.
 //!
 //! # Problem
@@ -192,7 +196,6 @@ const fn sibling_offset(k: usize, lead_pos: usize) -> usize {
 /// - Reads each boundary digest from a group member's full path.
 ///
 /// The output order matches what restoration consumes.
-#[cfg(test)]
 pub(crate) fn prune_paths<D, const DIGEST_ELEMS: usize>(
     arity_schedule: &[usize],
     paths: &[MerkleAuthPath<D, DIGEST_ELEMS>],

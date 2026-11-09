@@ -1,7 +1,13 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #![doc = include_str!("../README.md")]
 #![no_std]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display, Formatter};
@@ -25,6 +31,8 @@ pub mod extension;
 pub mod horizontally_truncated;
 pub mod interpolation;
 pub mod row_index_mapped;
+#[cfg(feature = "secret-memory")]
+pub mod secret;
 pub mod stack;
 pub mod strided;
 pub mod util;

@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use alloc::vec::Vec;
 
 use p3_air::{AirBuilder, ExtensionBuilder, PermutationAirBuilder, RowWindow};
@@ -14,6 +18,18 @@ pub struct ProverConstraintFolderWithLookups<'a, SC: StarkGenericConfig> {
     pub permutation: RowMajorMatrixView<'a, PackedChallenge<SC>>,
     pub permutation_challenges: &'a [PackedChallenge<SC>],
     pub permutation_values: &'a [PackedChallenge<SC>],
+}
+
+#[cfg(feature = "secret-memory")]
+impl<SC> zeroize::Zeroize for ProverConstraintFolderWithLookups<'_, SC>
+where
+    SC: StarkGenericConfig,
+    PackedVal<SC>: zeroize::Zeroize,
+    PackedChallenge<SC>: zeroize::Zeroize,
+{
+    fn zeroize(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.inner);
+    }
 }
 
 impl<'a, SC: StarkGenericConfig> AirBuilder for ProverConstraintFolderWithLookups<'a, SC> {

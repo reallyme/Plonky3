@@ -1,3 +1,7 @@
+<!-- Modified by ReallyMe Technologies Limited, 2026. -->
+<!-- SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited -->
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+
 # Changelog
 
 All notable changes to this project will be documented in this file.
@@ -6,6 +10,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- Add guarded MMCS, PCS, and univariate quotient-commitment capability traits for erasable
+  prover data.
+- Add a guarded univariate domain-evaluation capability that returns owned zeroizing matrices
+  instead of borrowing ordinary PCS views.
+- Extend guarded univariate evaluation with an explicit source-reconstruction operation so hiding
+  wrappers can reverse their commitment-time masking layout rather than evaluating a different
+  lower-degree polynomial.
+- Add a guarded recomputable-MMCS capability that irreversibly erases committed matrices and
+  authenticates independently reconstructed multi-query rows against retained commitment state.
+- Add a guarded PCS opening capability whose mutable request owners permit implementations to
+  erase retained codewords only after Fiat-Shamir fixes the verifier-selected query indices.
+- Add a guarded detached-PCS commitment capability for implementations that can construct the
+  canonical commitment while returning authentication-only prover state instead of retained value
+  matrices.
+- Add an ordered mixed-opening capability that keeps reusable public preprocessing under ordinary
+  immutable ownership while private commitment rounds retain single-use guarded ownership.
+- Add a typed multi-instance quotient input and guarded commitment capability that preserves all
+  instance chunks under one PCS root in the batch-STARK verifier's canonical order.
+- Add a public quotient-plan and guarded generator capability so a PCS can consume one instance
+  quotient at a time while retaining the canonical shared commitment order.
+- Extend guarded univariate STARK commitment capabilities to construct optional randomization
+  commitments without placing generated masking evaluations in ordinary memory.
+- Forward guarded ownership through `ExtensionMmcs`, retaining extension-field matrices behind
+  zeroizing owners while the inner base-field MMCS commits and opens their flattened views.
+
 ## [0.8.0] - 2026-09-23
 ### Merged PRs
 - Ci: fail on unused dependencies, and drop the ones already there (#2029)
@@ -78,4 +108,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Thomas Coratger
 - o-k-d
 - sashass1315
-

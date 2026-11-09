@@ -1,8 +1,16 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use alloc::vec::Vec;
 
 use p3_field::Field;
+#[cfg(feature = "secret-memory")]
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 use crate::CryptographicHasher;
+#[cfg(feature = "secret-memory")]
+use crate::IncrementalCryptographicHasher;
 
 /// Byte target for one group of serialized rows passed to the inner hasher.
 ///
@@ -12,6 +20,10 @@ use crate::CryptographicHasher;
 /// is always a whole number of lane groups, so one lane group of wider rows overshoots it rather
 /// than leaving lanes idle. The inner hasher is the one that knows what a full call costs.
 const ROW_BYTES_SCRATCH: usize = 8 * 1024;
+#[cfg(feature = "secret-memory")]
+const U32_WORD_BYTES: usize = core::mem::size_of::<u32>();
+#[cfg(feature = "secret-memory")]
+const U64_WORD_BYTES: usize = core::mem::size_of::<u64>();
 
 /// Converts a hasher which can hash bytes, u32's or u64's into a hasher which can hash field elements.
 ///
@@ -22,6 +34,30 @@ const ROW_BYTES_SCRATCH: usize = 8 * 1024;
 #[derive(Copy, Clone, Debug)]
 pub struct SerializingHasher<Inner> {
     inner: Inner,
+}
+
+/// Incremental field-serialization state for a fixed-width output word.
+///
+/// A chunk can end partway through a word. The pending bytes must survive until
+/// the next chunk so chunk boundaries do not become cryptographic message
+/// boundaries. Both the pending bytes and their length erase on drop alongside
+/// the inner hash state.
+#[cfg(feature = "secret-memory")]
+pub struct IncrementalSerializationState<State, const WORD_BYTES: usize>
+where
+    State: ZeroizeOnDrop,
+{
+    inner: State,
+    pending: Zeroizing<[u8; WORD_BYTES]>,
+    pending_len: Zeroizing<usize>,
+}
+
+#[cfg(feature = "secret-memory")]
+impl<State, const WORD_BYTES: usize> ZeroizeOnDrop
+    for IncrementalSerializationState<State, WORD_BYTES>
+where
+    State: ZeroizeOnDrop,
+{
 }
 
 impl<Inner> SerializingHasher<Inner> {
@@ -164,6 +200,131 @@ where
     }
 }
 
+#[cfg(feature = "secret-memory")]
+impl<F, Inner, const N: usize> IncrementalCryptographicHasher<F, [u8; N]>
+    for SerializingHasher<Inner>
+where
+    F: Field,
+    Inner: IncrementalCryptographicHasher<u8, [u8; N]>,
+{
+    type State = Inner::State;
+
+    fn begin_hash(&self) -> Self::State {
+        self.inner.begin_hash()
+    }
+
+    fn absorb<I>(&self, state: &mut Self::State, input: I)
+    where
+        I: IntoIterator<Item = F>,
+    {
+        self.inner.absorb(state, F::into_byte_stream(input));
+    }
+
+    fn finalize_hash(&self, state: Self::State) -> [u8; N] {
+        self.inner.finalize_hash(state)
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<F, Inner, const N: usize> IncrementalCryptographicHasher<F, [u32; N]>
+    for SerializingHasher<Inner>
+where
+    F: Field,
+    Inner: IncrementalCryptographicHasher<u32, [u32; N]>,
+{
+    type State = IncrementalSerializationState<Inner::State, U32_WORD_BYTES>;
+
+    fn begin_hash(&self) -> Self::State {
+        IncrementalSerializationState {
+            inner: self.inner.begin_hash(),
+            pending: Zeroizing::new([0_u8; U32_WORD_BYTES]),
+            pending_len: Zeroizing::new(0),
+        }
+    }
+
+    fn absorb<I>(&self, state: &mut Self::State, input: I)
+    where
+        I: IntoIterator<Item = F>,
+    {
+        for byte in F::into_byte_stream(input) {
+            let pending_len = *state.pending_len;
+            state.pending[pending_len] = byte;
+            *state.pending_len = pending_len + 1;
+            if *state.pending_len == U32_WORD_BYTES {
+                self.inner.absorb(
+                    &mut state.inner,
+                    core::iter::once(u32::from_le_bytes(*state.pending)),
+                );
+                state.pending.fill(0);
+                *state.pending_len = 0;
+            }
+        }
+    }
+
+    fn finalize_hash(&self, state: Self::State) -> [u32; N] {
+        let IncrementalSerializationState {
+            mut inner,
+            pending,
+            pending_len,
+        } = state;
+        if *pending_len != 0 {
+            self.inner
+                .absorb(&mut inner, core::iter::once(u32::from_le_bytes(*pending)));
+        }
+        self.inner.finalize_hash(inner)
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<F, Inner, const N: usize> IncrementalCryptographicHasher<F, [u64; N]>
+    for SerializingHasher<Inner>
+where
+    F: Field,
+    Inner: IncrementalCryptographicHasher<u64, [u64; N]>,
+{
+    type State = IncrementalSerializationState<Inner::State, U64_WORD_BYTES>;
+
+    fn begin_hash(&self) -> Self::State {
+        IncrementalSerializationState {
+            inner: self.inner.begin_hash(),
+            pending: Zeroizing::new([0_u8; U64_WORD_BYTES]),
+            pending_len: Zeroizing::new(0),
+        }
+    }
+
+    fn absorb<I>(&self, state: &mut Self::State, input: I)
+    where
+        I: IntoIterator<Item = F>,
+    {
+        for byte in F::into_byte_stream(input) {
+            let pending_len = *state.pending_len;
+            state.pending[pending_len] = byte;
+            *state.pending_len = pending_len + 1;
+            if *state.pending_len == U64_WORD_BYTES {
+                self.inner.absorb(
+                    &mut state.inner,
+                    core::iter::once(u64::from_le_bytes(*state.pending)),
+                );
+                state.pending.fill(0);
+                *state.pending_len = 0;
+            }
+        }
+    }
+
+    fn finalize_hash(&self, state: Self::State) -> [u64; N] {
+        let IncrementalSerializationState {
+            mut inner,
+            pending,
+            pending_len,
+        } = state;
+        if *pending_len != 0 {
+            self.inner
+                .absorb(&mut inner, core::iter::once(u64::from_le_bytes(*pending)));
+        }
+        self.inner.finalize_hash(inner)
+    }
+}
+
 impl<F, Inner, const N: usize, const M: usize> CryptographicHasher<[F; M], [[u8; M]; N]>
     for SerializingHasher<Inner>
 where
@@ -216,7 +377,11 @@ mod tests {
 
     use p3_field::PrimeCharacteristicRing;
     use p3_koala_bear::KoalaBear;
+    #[cfg(feature = "secret-memory")]
+    use zeroize::Zeroizing;
 
+    #[cfg(feature = "secret-memory")]
+    use crate::IncrementalCryptographicHasher;
     use crate::{CryptographicHasher, SerializingHasher};
 
     #[derive(Clone)]
@@ -273,6 +438,85 @@ mod tests {
             let sum: u64 = iter.into_iter().fold(0, |acc, x| acc.wrapping_add(x));
             // Simplest impl: set every element to the sum
             [sum; 4]
+        }
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[derive(Clone, Copy)]
+    struct WordFold;
+
+    #[cfg(feature = "secret-memory")]
+    impl CryptographicHasher<u64, [u64; 2]> for WordFold {
+        fn hash_iter<I>(&self, input: I) -> [u64; 2]
+        where
+            I: IntoIterator<Item = u64>,
+        {
+            fold_words(input)
+        }
+    }
+
+    #[cfg(feature = "secret-memory")]
+    impl IncrementalCryptographicHasher<u64, [u64; 2]> for WordFold {
+        type State = Zeroizing<Vec<u64>>;
+
+        fn begin_hash(&self) -> Self::State {
+            Zeroizing::new(Vec::new())
+        }
+
+        fn absorb<I>(&self, state: &mut Self::State, input: I)
+        where
+            I: IntoIterator<Item = u64>,
+        {
+            state.extend(input);
+        }
+
+        fn finalize_hash(&self, state: Self::State) -> [u64; 2] {
+            fold_words(state.iter().copied())
+        }
+    }
+
+    #[cfg(feature = "secret-memory")]
+    fn fold_words<I>(input: I) -> [u64; 2]
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        let mut value = 0_u64;
+        let mut length = 0_u64;
+        for word in input {
+            value = value.wrapping_mul(257).wrapping_add(word);
+            length = length.wrapping_add(1);
+        }
+        [value, length]
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn incremental_u64_serialization_carries_half_words_across_chunks() {
+        type Hasher = SerializingHasher<WordFold>;
+        type Digest = [u64; 2];
+
+        let hasher = SerializingHasher::new(WordFold);
+        let input: [KoalaBear; 7] = KoalaBear::new_array(array::from_fn(|index| index as u32));
+        let expected: Digest = hasher.hash_slice(&input);
+
+        for split in [0_usize, 1, 2, 3, 6, 7] {
+            let mut state =
+                <Hasher as IncrementalCryptographicHasher<KoalaBear, Digest>>::begin_hash(&hasher);
+            <Hasher as IncrementalCryptographicHasher<KoalaBear, Digest>>::absorb(
+                &hasher,
+                &mut state,
+                input[..split].iter().copied(),
+            );
+            <Hasher as IncrementalCryptographicHasher<KoalaBear, Digest>>::absorb(
+                &hasher,
+                &mut state,
+                input[split..].iter().copied(),
+            );
+            let actual =
+                <Hasher as IncrementalCryptographicHasher<KoalaBear, Digest>>::finalize_hash(
+                    &hasher, state,
+                );
+            assert_eq!(actual, expected, "split {split}");
         }
     }
 

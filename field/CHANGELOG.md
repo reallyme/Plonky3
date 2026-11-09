@@ -1,3 +1,7 @@
+<!-- Modified by ReallyMe Technologies Limited, 2026. -->
+<!-- SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited -->
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+
 # Changelog
 
 All notable changes to this project will be documented in this file.
@@ -6,6 +10,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- Add opt-in erasure support for extension-field values used by secret prover owners.
+- Add transitive opt-in erasure for packed extension-field values used by guarded SIMD
+  constraint evaluation.
+
 ## [0.8.0] - 2026-09-23
 ### Merged PRs
 - Ci: fail on unused dependencies, and drop the ones already there (#2029)
@@ -144,4 +153,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Thomas Coratger
 - Tom Wambsgans
 - Zach Langley
-

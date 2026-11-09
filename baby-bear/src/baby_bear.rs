@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use p3_field::exponentiation::exp_1725656503;
 use p3_field::{Algebra, PrimeCharacteristicRing, UniformSamplingField};
 use p3_monty_31::{
@@ -201,6 +205,16 @@ mod tests {
         assert_eq!(F::TWO.injective_exp_n().injective_exp_root_n(), F::TWO);
 
         test_field_json_serialization(&[f, f_1, f_2, f_p_minus_1, f_p_minus_2, m1, m2]);
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn baby_bear_value_is_zeroized() {
+        let mut value = BabyBear::new(0x1234_5678);
+
+        zeroize::Zeroize::zeroize(&mut value);
+
+        assert_eq!(value, BabyBear::ZERO);
     }
 
     proptest! {

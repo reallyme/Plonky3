@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The [`Mmcs`] trait implementation: commit, then open and verify one index or many.
 
 use alloc::vec::Vec;
@@ -6,9 +10,16 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 use itertools::Itertools;
 use p3_commit::{BatchOpening, BatchOpeningRef, Mmcs, MmcsProofGeometry, RowSink};
+#[cfg(feature = "secret-memory")]
+use p3_commit::{
+    SecretDetachedCommitment, SecretMmcs, SecretProverData, SecretRecomputableMmcs,
+    SecretStreamingMmcsCommitment, SecretStreamingRecomputableMmcs,
+};
 use p3_field::PackedValue;
 use p3_matrix::dense::RowMajorMatrix;
 use p3_matrix::{Dimensions, Matrix};
+#[cfg(feature = "secret-memory")]
+use p3_symmetric::IncrementalCryptographicHasher;
 use p3_symmetric::{CryptographicHasher, PseudoCompressionFunction};
 use p3_util::{DisjointMutPtr, log2_ceil_usize};
 use serde::{Deserialize, Serialize};
@@ -173,7 +184,7 @@ where
             matrix,
             digests,
         );
-        let effective_cap_height = self.cap_height.min(tree.num_layers().saturating_sub(1));
+        let (effective_cap_height, _) = self.cap_height_and_proof_levels(&tree);
         (tree.cap(effective_cap_height), tree)
     }
 
@@ -442,6 +453,184 @@ where
     }
 }
 
+#[cfg(feature = "secret-memory")]
+impl<P, PW, H, C, const N: usize, const DIGEST_ELEMS: usize> SecretMmcs<P::Value>
+    for MerkleTreeMmcs<P, PW, H, C, N, DIGEST_ELEMS>
+where
+    P: PackedValue,
+    P::Value: zeroize::Zeroize,
+    PW: PackedValue,
+    H: CryptographicHasher<P::Value, [PW::Value; DIGEST_ELEMS]>
+        + CryptographicHasher<P, [PW; DIGEST_ELEMS]>
+        + Sync,
+    C: PseudoCompressionFunction<[PW::Value; DIGEST_ELEMS], N>
+        + PseudoCompressionFunction<[PW; DIGEST_ELEMS], N>
+        + Sync,
+    PW::Value: Copy + Default + Eq + Clone + zeroize::Zeroize,
+    [PW::Value; DIGEST_ELEMS]: Serialize + for<'de> Deserialize<'de>,
+{
+    type SecretData<M>
+        = MerkleTree<P::Value, PW::Value, SecretProverData<M>, N, DIGEST_ELEMS>
+    where
+        M: Matrix<P::Value> + zeroize::Zeroize;
+    type SecretError = MerkleTreeError;
+
+    fn commit_secret<M>(
+        &self,
+        inputs: Vec<SecretProverData<M>>,
+    ) -> Result<(Self::Commitment, SecretProverData<Self::SecretData<M>>), Self::SecretError>
+    where
+        M: Matrix<P::Value> + zeroize::Zeroize,
+    {
+        validate_commit_reachable_heights(inputs.iter().map(Matrix::height))?;
+        let tree = MerkleTree::new::<P, PW, H, C>(&self.hash, &self.compress, inputs);
+        let effective_cap_height = self.cap_height.min(tree.num_layers().saturating_sub(1));
+        let cap = tree.cap(effective_cap_height);
+        Ok((cap, SecretProverData::new(tree)))
+    }
+
+    fn open_batch_secret<M>(
+        &self,
+        index: usize,
+        prover_data: &SecretProverData<Self::SecretData<M>>,
+    ) -> Result<BatchOpening<P::Value, Self>, Self::SecretError>
+    where
+        M: Matrix<P::Value> + zeroize::Zeroize,
+    {
+        let max_height = prover_data
+            .leaves
+            .iter()
+            .map(Matrix::height)
+            .max()
+            .ok_or(MerkleTreeError::EmptyBatch)?;
+        if index >= max_height {
+            return Err(MerkleTreeError::IndexOutOfBounds { max_height, index });
+        }
+        Ok(<Self as Mmcs<P::Value>>::open_batch(
+            self,
+            index,
+            prover_data,
+        ))
+    }
+
+    fn get_matrices_secret<'a, M>(
+        &self,
+        prover_data: &'a SecretProverData<Self::SecretData<M>>,
+    ) -> Vec<&'a M>
+    where
+        M: Matrix<P::Value> + zeroize::Zeroize,
+    {
+        prover_data.leaves.iter().map(|matrix| &**matrix).collect()
+    }
+
+    fn open_multi_batch_secret<M>(
+        &self,
+        indices: &[usize],
+        prover_data: &SecretProverData<Self::SecretData<M>>,
+    ) -> Result<(Vec<Vec<Vec<P::Value>>>, Self::MultiProof), Self::SecretError>
+    where
+        M: Matrix<P::Value> + zeroize::Zeroize,
+    {
+        let max_height = prover_data
+            .leaves
+            .iter()
+            .map(Matrix::height)
+            .max()
+            .ok_or(MerkleTreeError::EmptyBatch)?;
+        if let Some(&index) = indices.iter().find(|&&index| index >= max_height) {
+            return Err(MerkleTreeError::IndexOutOfBounds { max_height, index });
+        }
+        Ok(<Self as Mmcs<P::Value>>::open_multi_batch(
+            self,
+            indices,
+            prover_data,
+        ))
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<P, PW, H, C, const N: usize, const DIGEST_ELEMS: usize> SecretRecomputableMmcs<P::Value>
+    for MerkleTreeMmcs<P, PW, H, C, N, DIGEST_ELEMS>
+where
+    P: PackedValue,
+    P::Value: zeroize::Zeroize,
+    PW: PackedValue,
+    H: CryptographicHasher<P::Value, [PW::Value; DIGEST_ELEMS]>
+        + CryptographicHasher<P, [PW; DIGEST_ELEMS]>
+        + IncrementalCryptographicHasher<P::Value, [PW::Value; DIGEST_ELEMS]>
+        + Sync,
+    C: PseudoCompressionFunction<[PW::Value; DIGEST_ELEMS], N>
+        + PseudoCompressionFunction<[PW; DIGEST_ELEMS], N>
+        + Sync,
+    PW::Value: Copy + Default + Eq + Clone + zeroize::Zeroize,
+    [PW::Value; DIGEST_ELEMS]: Serialize + for<'de> Deserialize<'de>,
+{
+    type AuthenticationData<M>
+        = crate::MerkleTreeAuthenticationData<P::Value, PW::Value, N, DIGEST_ELEMS>
+    where
+        M: Matrix<P::Value> + zeroize::Zeroize;
+
+    fn commit_detached_secret<M>(
+        &self,
+        inputs: Vec<SecretProverData<M>>,
+    ) -> Result<
+        SecretDetachedCommitment<
+            Self::Commitment,
+            Self::SecretData<M>,
+            Self::AuthenticationData<M>,
+        >,
+        Self::SecretError,
+    >
+    where
+        M: Matrix<P::Value> + zeroize::Zeroize,
+    {
+        let mut dimensions = Vec::new();
+        dimensions
+            .try_reserve_exact(inputs.len())
+            .map_err(|_| MerkleTreeError::SecretAllocationFailed)?;
+        dimensions.extend(inputs.iter().map(|matrix| matrix.dimensions()));
+
+        let mut stream =
+            <Self as SecretStreamingRecomputableMmcs<P::Value>>::begin_streaming_commitment::<M>(
+                self, dimensions,
+            )?;
+        let mut indexed_inputs = Vec::new();
+        indexed_inputs
+            .try_reserve_exact(inputs.len())
+            .map_err(|_| MerkleTreeError::SecretAllocationFailed)?;
+        indexed_inputs.extend(inputs.into_iter().enumerate());
+        indexed_inputs.sort_by_key(|(_, matrix)| Reverse(matrix.height()));
+        for (matrix_index, input) in indexed_inputs {
+            stream.try_absorb_at(matrix_index, input)?;
+        }
+        stream.finish()
+    }
+
+    fn detach_authentication_data<M>(
+        &self,
+        prover_data: &mut SecretProverData<Self::SecretData<M>>,
+    ) -> Result<Self::AuthenticationData<M>, Self::SecretError>
+    where
+        M: Matrix<P::Value> + zeroize::Zeroize,
+    {
+        prover_data.erase_leaves_into_authentication_data()
+    }
+
+    fn open_multi_batch_from_recomputed_rows<M>(
+        &self,
+        indices: &[usize],
+        opened_rows: &[Vec<Vec<P::Value>>],
+        authentication_data: &Self::AuthenticationData<M>,
+    ) -> Result<(Vec<Vec<Vec<P::Value>>>, Self::MultiProof), Self::SecretError>
+    where
+        M: Matrix<P::Value> + zeroize::Zeroize,
+    {
+        let opening =
+            self.open_batch_pruned_with_recomputed_rows(indices, opened_rows, authentication_data)?;
+        Ok((opening.opened_values, opening.pruned_proof))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -449,12 +638,24 @@ mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
     use std::panic::AssertUnwindSafe;
+    #[cfg(feature = "secret-memory")]
+    use std::panic::catch_unwind;
+    #[cfg(feature = "secret-memory")]
+    use std::sync::Arc;
+    #[cfg(feature = "secret-memory")]
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use itertools::Itertools;
     use p3_baby_bear::{BabyBear, Poseidon2BabyBear};
     use p3_commit::{BatchOpeningRef, Mmcs};
+    #[cfg(feature = "secret-memory")]
+    use p3_commit::{SecretDetachedCommitment, SecretMmcs, SecretRecomputableMmcs};
     use p3_field::{Field, PrimeCharacteristicRing};
     use p3_matrix::dense::RowMajorMatrix;
+    #[cfg(feature = "secret-memory")]
+    use p3_matrix::dense::RowMajorMatrixViewMut;
+    #[cfg(feature = "secret-memory")]
+    use p3_matrix::secret::ZeroizingMatrix;
     use p3_matrix::{Dimensions, Matrix};
     use p3_symmetric::{
         CryptographicHasher, PaddingFreeSponge, PseudoCompressionFunction, TruncatedPermutation,
@@ -463,6 +664,7 @@ mod tests {
     use rand::SeedableRng;
     use rand::rngs::SmallRng;
 
+    use crate::mmcs::derive_arity_schedule;
     use crate::{MerkleCap, MerkleTreeError, MerkleTreeMmcs};
 
     type F = BabyBear;
@@ -535,6 +737,51 @@ mod tests {
                 );
                 assert_eq!(streamed.opened_values, committed.opened_values);
                 assert_eq!(streamed.opening_proof, committed.opening_proof);
+            }
+        }
+    }
+
+    #[cfg(feature = "secret-memory")]
+    fn secret_mmcs() -> MyMmcs {
+        secret_mmcs_with_cap(0)
+    }
+
+    #[cfg(feature = "secret-memory")]
+    fn secret_mmcs_with_cap(cap_height: usize) -> MyMmcs {
+        let mut rng = SmallRng::seed_from_u64(0x5245_414c_4c59_4d45);
+        let permutation = Perm::new_from_rng_128(&mut rng);
+        let hash = MyHash::new(permutation.clone());
+        let compress = MyCompress::new(permutation);
+        MyMmcs::new(hash, compress, cap_height)
+    }
+
+    #[cfg(feature = "secret-memory")]
+    struct LifecycleMatrix {
+        matrix: RowMajorMatrix<F>,
+        erased: Arc<AtomicBool>,
+        required_erasure: Option<Arc<AtomicBool>>,
+    }
+
+    #[cfg(feature = "secret-memory")]
+    impl LifecycleMatrix {
+        fn new(
+            matrix: RowMajorMatrix<F>,
+            erased: Arc<AtomicBool>,
+            required_erasure: Option<Arc<AtomicBool>>,
+        ) -> Self {
+            Self {
+                matrix,
+                erased,
+                required_erasure,
+            }
+        }
+
+        fn assert_predecessor_erased(&self) {
+            if let Some(required_erasure) = &self.required_erasure {
+                assert!(
+                    required_erasure.load(Ordering::SeqCst),
+                    "a shorter matrix was read before the preceding height group was erased"
+                );
             }
         }
     }
@@ -669,6 +916,410 @@ mod tests {
             assert_eq!(values.capacity(), width);
             assert!(values.into_iter().eq(0..width));
         }
+    }
+
+    #[cfg(feature = "secret-memory")]
+    impl Matrix<F> for LifecycleMatrix {
+        fn width(&self) -> usize {
+            self.matrix.width()
+        }
+
+        fn height(&self) -> usize {
+            self.matrix.height()
+        }
+
+        unsafe fn row_unchecked(
+            &self,
+            row: usize,
+        ) -> impl IntoIterator<Item = F, IntoIter = impl Iterator<Item = F> + Send + Sync> {
+            self.assert_predecessor_erased();
+            unsafe { self.matrix.row_unchecked(row) }
+        }
+    }
+
+    #[cfg(feature = "secret-memory")]
+    impl zeroize::Zeroize for LifecycleMatrix {
+        fn zeroize(&mut self) {
+            zeroize::Zeroize::zeroize(&mut self.matrix);
+            self.erased.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn zeroizing_tree_owner_erases_borrowed_leaf_storage_on_drop() {
+        let mmcs = secret_mmcs();
+        let mut values = [
+            F::from_u32(0x00ad_beef),
+            F::from_u32(0x1245_414c),
+            F::from_u32(0x0c59_4d45),
+            F::from_u32(0x0102_0304),
+        ];
+        {
+            let view = RowMajorMatrixViewMut::new(&mut values, 2);
+            let leaf = ZeroizingMatrix::new(view);
+            let (_commitment, _prover_data) = mmcs
+                .commit_secret(vec![leaf])
+                .expect("valid guarded commitment must succeed");
+        }
+
+        assert_eq!(values, [F::ZERO; 4]);
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn zeroizing_tree_owner_erases_borrowed_leaf_storage_during_unwind() {
+        let mmcs = secret_mmcs();
+        let mut values = [F::ONE, F::TWO, F::NEG_ONE, F::GENERATOR];
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let view = RowMajorMatrixViewMut::new(&mut values, 2);
+            let leaf = ZeroizingMatrix::new(view);
+            let (_commitment, _prover_data) = mmcs
+                .commit_secret(vec![leaf])
+                .expect("valid guarded commitment must succeed");
+            panic!("exercise Merkle prover-data unwind cleanup");
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(values, [F::ZERO; 4]);
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_inputs_are_erased_when_commitment_validation_returns_error() {
+        let mmcs = secret_mmcs();
+        let mut tall_values = [F::ONE; 7];
+        let mut unreachable_values = [F::TWO; 3];
+        let result = {
+            let tall = ZeroizingMatrix::new(RowMajorMatrixViewMut::new(&mut tall_values, 1));
+            let unreachable =
+                ZeroizingMatrix::new(RowMajorMatrixViewMut::new(&mut unreachable_values, 1));
+            mmcs.commit_secret(vec![tall, unreachable])
+        };
+
+        assert!(matches!(
+            &result,
+            Err(MerkleTreeError::IncompatibleHeights { .. })
+        ));
+        drop(result);
+        assert_eq!(tall_values, [F::ZERO; 7]);
+        assert_eq!(unreachable_values, [F::ZERO; 3]);
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn detached_commit_erases_inputs_and_authenticates_recomputed_rows() {
+        let mmcs = secret_mmcs();
+        let original_values = [F::ONE, F::TWO, F::NEG_ONE, F::GENERATOR];
+        let expected_matrix = RowMajorMatrix::new(original_values.to_vec(), 2);
+        let (expected_commitment, _expected_data) = mmcs.commit(vec![expected_matrix]);
+        let mut guarded_values = original_values;
+        let guarded_matrix =
+            ZeroizingMatrix::new(RowMajorMatrixViewMut::new(&mut guarded_values, 2));
+
+        let SecretDetachedCommitment {
+            commitment,
+            prover_data,
+            authentication_data,
+        } = mmcs
+            .commit_detached_secret(vec![guarded_matrix])
+            .expect("valid detached commitment must succeed");
+
+        assert_eq!(commitment, expected_commitment);
+        assert!(mmcs.get_matrices_secret(&prover_data).is_empty());
+        drop(prover_data);
+        assert_eq!(
+            authentication_data.dimensions(),
+            [Dimensions {
+                width: 2,
+                height: 2,
+            }]
+        );
+
+        let recomputed_rows = [vec![F::NEG_ONE, F::GENERATOR]];
+        let (opened_values, proof) = mmcs
+            .open_multi_batch_from_recomputed_rows::<RowMajorMatrix<F>>(
+                &[1],
+                &[recomputed_rows.to_vec()],
+                &authentication_data,
+            )
+            .expect("recomputed row must authenticate after direct detachment");
+        mmcs.verify_multi_batch(
+            &commitment,
+            authentication_data.dimensions(),
+            &[1],
+            &opened_values,
+            &proof,
+        )
+        .expect("directly detached commitment must verify");
+        drop(authentication_data);
+        drop(commitment);
+        assert_eq!(guarded_values, [F::ZERO; 4]);
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn detached_commit_consumes_height_groups_in_order_and_matches_capped_commitment() {
+        let mmcs = secret_mmcs_with_cap(2);
+        let tall_values = (1_u32..=16).map(F::from_u32).collect_vec();
+        let middle_values = (101_u32..=104).map(F::from_u32).collect_vec();
+        let short_values = (201_u32..=206).map(F::from_u32).collect_vec();
+        let expected_matrices = vec![
+            RowMajorMatrix::new(middle_values.clone(), 1),
+            RowMajorMatrix::new(tall_values.clone(), 2),
+            RowMajorMatrix::new(short_values.clone(), 3),
+        ];
+        let (expected_commitment, _expected_data) = mmcs.commit(expected_matrices);
+
+        let tall_erased = Arc::new(AtomicBool::new(false));
+        let middle_erased = Arc::new(AtomicBool::new(false));
+        let short_erased = Arc::new(AtomicBool::new(false));
+        let inputs = vec![
+            p3_commit::SecretProverData::new(LifecycleMatrix::new(
+                RowMajorMatrix::new(middle_values, 1),
+                Arc::clone(&middle_erased),
+                Some(Arc::clone(&tall_erased)),
+            )),
+            p3_commit::SecretProverData::new(LifecycleMatrix::new(
+                RowMajorMatrix::new(tall_values, 2),
+                Arc::clone(&tall_erased),
+                None,
+            )),
+            p3_commit::SecretProverData::new(LifecycleMatrix::new(
+                RowMajorMatrix::new(short_values, 3),
+                Arc::clone(&short_erased),
+                Some(Arc::clone(&middle_erased)),
+            )),
+        ];
+
+        let detached = mmcs
+            .commit_detached_secret(inputs)
+            .expect("a valid multi-height commitment must detach while building");
+
+        assert_eq!(detached.commitment, expected_commitment);
+        assert!(tall_erased.load(Ordering::SeqCst));
+        assert!(middle_erased.load(Ordering::SeqCst));
+        assert!(short_erased.load(Ordering::SeqCst));
+        assert!(mmcs.get_matrices_secret(&detached.prover_data).is_empty());
+        assert_eq!(
+            detached.authentication_data.dimensions(),
+            [
+                Dimensions {
+                    width: 1,
+                    height: 4,
+                },
+                Dimensions {
+                    width: 2,
+                    height: 8,
+                },
+                Dimensions {
+                    width: 3,
+                    height: 2,
+                },
+            ]
+        );
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_opening_returns_typed_bounds_error() {
+        let mmcs = secret_mmcs();
+        let mut values = [F::ONE; 8];
+        {
+            let matrix = ZeroizingMatrix::new(RowMajorMatrixViewMut::new(values.as_mut_slice(), 1));
+            let (_commitment, prover_data) = mmcs
+                .commit_secret(vec![matrix])
+                .expect("valid guarded commitment must succeed");
+
+            let opening = mmcs
+                .open_batch_secret(7, &prover_data)
+                .expect("last guarded row must open");
+            assert_eq!(opening.opened_values, vec![vec![F::ONE]]);
+            assert!(matches!(
+                mmcs.open_batch_secret(8, &prover_data),
+                Err(MerkleTreeError::IndexOutOfBounds {
+                    max_height: 8,
+                    index: 8
+                })
+            ));
+        }
+        assert_eq!(values, [F::ZERO; 8]);
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn erased_leaves_can_be_recomputed_for_identical_single_and_pruned_openings() {
+        let mmcs = secret_mmcs();
+        let mut tall_values = [
+            F::from_u32(0x00ad_beef),
+            F::from_u32(0x1245_414c),
+            F::from_u32(0x0c59_4d45),
+            F::from_u32(0x0102_0304),
+            F::from_u32(0x0005_0607),
+            F::from_u32(0x0008_090a),
+            F::from_u32(0x000b_0c0d),
+            F::from_u32(0x000e_0f10),
+            F::from_u32(0x0011_1213),
+            F::from_u32(0x0014_1516),
+            F::from_u32(0x0017_1819),
+            F::from_u32(0x001a_1b1c),
+            F::from_u32(0x001d_1e1f),
+            F::from_u32(0x0020_2122),
+            F::from_u32(0x0023_2425),
+            F::from_u32(0x0026_2728),
+        ];
+        let mut short_values = [
+            F::from_u32(0x0029_2a2b),
+            F::from_u32(0x002c_2d2e),
+            F::from_u32(0x002f_3031),
+            F::from_u32(0x0032_3334),
+            F::from_u32(0x0035_3637),
+            F::from_u32(0x0038_393a),
+            F::from_u32(0x003b_3c3d),
+            F::from_u32(0x003e_3f40),
+            F::from_u32(0x0041_4243),
+            F::from_u32(0x0044_4546),
+            F::from_u32(0x0047_4849),
+            F::from_u32(0x004a_4b4c),
+        ];
+        let mut recomputed = vec![
+            RowMajorMatrix::new(tall_values.to_vec(), 2),
+            RowMajorMatrix::new(short_values.to_vec(), 3),
+        ];
+        let dimensions = recomputed.iter().map(Matrix::dimensions).collect_vec();
+        let query_index = 5;
+        let query_indices = [0, 3, 5, 7];
+
+        let (commitment, mut prover_data) = {
+            let tall = ZeroizingMatrix::new(RowMajorMatrixViewMut::new(&mut tall_values, 2));
+            let short = ZeroizingMatrix::new(RowMajorMatrixViewMut::new(&mut short_values, 3));
+            mmcs.commit_secret(vec![tall, short])
+                .expect("valid guarded commitment must succeed")
+        };
+        let ordinary = mmcs
+            .open_batch_secret(query_index, &prover_data)
+            .expect("committed row must open before leaf erasure");
+        let (ordinary_multi_values, ordinary_multi_proof) = mmcs
+            .open_multi_batch_secret(&query_indices, &prover_data)
+            .expect("committed rows must open before leaf erasure");
+
+        let authentication_data = prover_data
+            .erase_leaves_into_authentication_data()
+            .expect("a committed tree must detach its authentication data");
+        drop(prover_data);
+
+        assert_eq!(tall_values, [F::ZERO; 16]);
+        assert_eq!(short_values, [F::ZERO; 12]);
+        assert_eq!(authentication_data.dimensions(), dimensions);
+        assert!(authentication_data.num_layers() > 1);
+
+        let recomputed_opening = mmcs
+            .open_batch_with_recomputed_matrices(query_index, &recomputed, &authentication_data)
+            .expect("shape-identical recomputed matrices must open");
+        assert_eq!(recomputed_opening.opened_values, ordinary.opened_values);
+        assert_eq!(recomputed_opening.opening_proof, ordinary.opening_proof);
+        mmcs.verify_batch(
+            &commitment,
+            &dimensions,
+            query_index,
+            (&recomputed_opening).into(),
+        )
+        .expect("recomputed single opening must verify against the original commitment");
+
+        let recomputed_multi = mmcs
+            .open_batch_pruned_with_recomputed_matrices(
+                &query_indices,
+                &recomputed,
+                &authentication_data,
+            )
+            .expect("shape-identical recomputed matrices must produce a pruned opening");
+        assert_eq!(recomputed_multi.opened_values, ordinary_multi_values);
+        assert_eq!(
+            recomputed_multi.pruned_proof.sibling_hashes,
+            ordinary_multi_proof.sibling_hashes
+        );
+        mmcs.verify_multi_batch(
+            &commitment,
+            &dimensions,
+            &query_indices,
+            &recomputed_multi.opened_values,
+            &recomputed_multi.pruned_proof,
+        )
+        .expect("recomputed pruned opening must verify against the original commitment");
+
+        recomputed[0].values[0] += F::ONE;
+        let substituted = mmcs
+            .open_batch_with_recomputed_matrices(0, &recomputed, &authentication_data)
+            .expect("shape-identical substituted data still has a well-formed Merkle path");
+        assert!(matches!(
+            mmcs.verify_batch(&commitment, &dimensions, 0, (&substituted).into()),
+            Err(MerkleTreeError::CapMismatch)
+        ));
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn recomputed_opening_rejects_count_shape_bounds_and_malformed_authentication_data() {
+        let mmcs = secret_mmcs();
+        let original_values = [F::ONE, F::TWO, F::NEG_ONE, F::GENERATOR];
+        let mut guarded_values = original_values;
+        let matrix = ZeroizingMatrix::new(RowMajorMatrixViewMut::new(&mut guarded_values, 2));
+        let (_commitment, mut prover_data) = mmcs
+            .commit_secret(vec![matrix])
+            .expect("valid guarded commitment must succeed");
+        let mut authentication_data = prover_data
+            .erase_leaves_into_authentication_data()
+            .expect("a committed tree must detach its authentication data");
+        assert!(matches!(
+            prover_data.erase_leaves_into_authentication_data(),
+            Err(MerkleTreeError::EmptyBatch)
+        ));
+        drop(prover_data);
+        assert_eq!(guarded_values, [F::ZERO; 4]);
+
+        let recomputed = RowMajorMatrix::new(original_values.to_vec(), 2);
+        let empty: Vec<RowMajorMatrix<F>> = Vec::new();
+        assert!(matches!(
+            mmcs.open_batch_with_recomputed_matrices(0, &empty, &authentication_data),
+            Err(MerkleTreeError::WrongBatchSize {
+                expected: 1,
+                got: 0
+            })
+        ));
+
+        let wrong_shape = [RowMajorMatrix::new(original_values.to_vec(), 1)];
+        assert!(matches!(
+            mmcs.open_batch_with_recomputed_matrices(0, &wrong_shape, &authentication_data),
+            Err(MerkleTreeError::RecomputedMatrixShapeMismatch {
+                matrix: 0,
+                expected_width: 2,
+                expected_height: 2,
+                got_width: 1,
+                got_height: 4,
+            })
+        ));
+
+        assert!(matches!(
+            mmcs.open_batch_with_recomputed_matrices(
+                2,
+                core::slice::from_ref(&recomputed),
+                &authentication_data,
+            ),
+            Err(MerkleTreeError::IndexOutOfBounds {
+                max_height: 2,
+                index: 2
+            })
+        ));
+
+        authentication_data.digest_layers.clear();
+        assert!(matches!(
+            mmcs.open_batch_with_recomputed_matrices(
+                0,
+                core::slice::from_ref(&recomputed),
+                &authentication_data,
+            ),
+            Err(MerkleTreeError::MalformedAuthenticationData)
+        ));
     }
 
     #[test]
@@ -1623,7 +2274,38 @@ mod tests {
             .collect();
         let dims: Vec<Dimensions> = mats.iter().map(|m| m.dimensions()).collect();
 
+        #[cfg(feature = "secret-memory")]
+        let guarded_mats = mats
+            .iter()
+            .cloned()
+            .map(p3_commit::SecretProverData::new)
+            .collect_vec();
+
         let (commit, prover_data) = mmcs.commit(mats);
+
+        #[cfg(feature = "secret-memory")]
+        {
+            let detached = mmcs
+                .commit_detached_secret(guarded_mats)
+                .expect("the consuming builder must accept reachable matrix heights");
+            assert_eq!(detached.commitment, commit);
+            assert_eq!(detached.authentication_data.dimensions(), dims);
+            assert!(mmcs.get_matrices_secret(&detached.prover_data).is_empty());
+        }
+
+        let planned_schedule = derive_arity_schedule(&dims, N)
+            .expect("reachable matrix heights must produce a Merkle schedule");
+        assert_eq!(planned_schedule, prover_data.arity_schedule);
+        let mut expected_proof_schedule = planned_schedule;
+        let (_, proof_levels) = mmcs
+            .arity_schedule_and_proof_levels(&dims)
+            .expect("reachable dimensions must produce verifier geometry");
+        expected_proof_schedule.truncate(proof_levels);
+        assert_eq!(
+            mmcs.proof_arity_schedule(&dims)
+                .expect("the verifier must derive the committed schedule"),
+            expected_proof_schedule
+        );
 
         let queries: Vec<usize> = raw_queries.iter().map(|&q| q % max_height).collect();
         let (opened_values, pruned_proof) = mmcs.open_multi_batch(&queries, &prover_data);

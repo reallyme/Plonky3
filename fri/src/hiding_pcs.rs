@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -8,14 +12,31 @@ use p3_commit::{
     CommitmentOpening, HidingMmcs, Mmcs, OpenedValues, OpeningRequest, Pcs, PolynomialSpace,
     UnivariateStarkPcs,
 };
+#[cfg(feature = "secret-memory")]
+use p3_commit::{
+    SecretDetachedPcsCommitter, SecretGeneratedQuotientCommitError,
+    SecretGeneratedQuotientCommitmentResult, SecretMmcs, SecretOpeningRequest, SecretPcsCommitter,
+    SecretPcsMixedOpener, SecretPcsMixedOpeningRequest, SecretPcsOpener, SecretProverData,
+    SecretQuotientCommitmentInput, SecretQuotientCommitmentPlan, SecretRecomputableMmcs,
+    SecretStreamingMmcsCommitment, SecretStreamingRecomputableMmcs,
+    SecretUnivariateStarkPcsCommitter, SecretUnivariateStarkPcsEvaluator,
+};
+#[cfg(feature = "secret-memory")]
+use p3_dft::SecretTwoAdicSubgroupDft;
 use p3_dft::TwoAdicSubgroupDft;
 use p3_field::coset::TwoAdicMultiplicativeCoset;
 use p3_field::{ExtensionField, PrimeField64, TwoAdicField, batch_multiplicative_inverse};
+#[cfg(feature = "secret-memory")]
+use p3_matrix::Dimensions;
 use p3_matrix::Matrix;
 use p3_matrix::bitrev::{BitReversalPerm, BitReversibleMatrix};
 use p3_matrix::dense::{DenseMatrix, RowMajorMatrix, RowMajorMatrixCow};
 use p3_matrix::horizontally_truncated::HorizontallyTruncated;
 use p3_matrix::row_index_mapped::RowIndexMappedView;
+#[cfg(feature = "secret-memory")]
+use p3_matrix::secret::SecretMatrixError;
+#[cfg(feature = "secret-memory")]
+use p3_matrix::util::reverse_matrix_index_bits;
 use p3_util::log2_strict_usize;
 use rand::distr::{Distribution, StandardUniform};
 use rand::rngs::StdRng;
@@ -23,6 +44,8 @@ use rand::{CryptoRng, RngExt, SeedableRng};
 use spin::Mutex;
 use tracing::info_span;
 
+#[cfg(feature = "secret-memory")]
+use crate::SecretTwoAdicPcsOpenError;
 use crate::verifier::FriError;
 use crate::{BatchMultiOpening, FriParameters, FriProof, FriProverError, TwoAdicFriPcs};
 
@@ -52,6 +75,78 @@ pub enum HidingFriProverError {
     /// The number of quotient evaluations differs from the chunk count.
     #[error("expected {expected} quotient chunks, got {got}")]
     QuotientChunkCountMismatch { expected: usize, got: usize },
+}
+
+/// Failure while constructing a guarded hiding-FRI commitment.
+#[cfg(feature = "secret-memory")]
+#[derive(Debug, thiserror::Error)]
+pub enum SecretHidingFriCommitError<InnerError> {
+    /// The hiding parameters cannot safely cover the configured disclosure budget.
+    #[error("guarded hiding-FRI budget validation failed")]
+    Hiding(#[from] HidingFriProverError),
+    /// Randomized matrix construction rejected a shape or allocation.
+    #[error("guarded hiding-FRI matrix randomization failed")]
+    Matrix(#[from] SecretMatrixError),
+    /// The vector retaining randomized matrix owners could not be reserved.
+    #[error("guarded hiding-FRI owner allocation failed")]
+    AllocationFailed,
+    /// The guarded inner PCS rejected commitment construction.
+    #[error("guarded hiding-FRI inner commitment failed")]
+    Inner(InnerError),
+}
+
+/// Failure while evaluating guarded hiding-PCS data on another domain.
+#[cfg(feature = "secret-memory")]
+#[derive(Debug, thiserror::Error)]
+pub enum SecretHidingFriEvaluationError<InnerError> {
+    /// Prover data was created with a different random-codeword count.
+    #[error("guarded hiding-FRI random-codeword configuration mismatch")]
+    RandomCodewordCountMismatch,
+    /// Prover data was created with a different FRI blowup.
+    #[error("guarded hiding-FRI blowup configuration mismatch")]
+    BlowupMismatch,
+    /// The inner evaluation matrix cannot contain the configured hiding columns.
+    #[error("guarded hiding-FRI evaluation width is invalid")]
+    InvalidRandomizedWidth,
+    /// Removing hiding columns failed without releasing their allocation.
+    #[error("guarded hiding-FRI evaluation truncation failed")]
+    Matrix(#[from] SecretMatrixError),
+    /// The inner PCS rejected guarded domain evaluation.
+    #[error("guarded hiding-FRI inner domain evaluation failed")]
+    Inner(InnerError),
+}
+
+/// Stable failures from guarded hiding-PCS opening construction.
+#[cfg(feature = "secret-memory")]
+#[derive(Debug, thiserror::Error)]
+pub enum SecretHidingFriOpenError {
+    /// Prover data was created with a different random-codeword count.
+    #[error("guarded hiding-FRI random-codeword configuration mismatch")]
+    RandomCodewordCountMismatch,
+    /// Prover data was created with a different FRI blowup.
+    #[error("guarded hiding-FRI blowup configuration mismatch")]
+    BlowupMismatch,
+    /// The guarded capability accepts private commitment rounds only.
+    #[error("guarded hiding-FRI opening does not accept preprocessing data")]
+    PreprocessedData,
+    /// Public preprocessing requests are duplicated or mislabeled.
+    #[error("guarded hiding-FRI public preprocessing layout is invalid")]
+    InvalidPublicPreprocessingLayout,
+    /// A commitment's retained matrix count or opening-value shape is invalid.
+    #[error("guarded hiding-FRI opening shape is invalid")]
+    InvalidShape,
+    /// The hiding parameters cannot safely cover the requested disclosures.
+    #[error("guarded hiding-FRI opening budget validation failed")]
+    Hiding(#[from] HidingFriProverError),
+    /// A private commitment has already been consumed by an opening attempt.
+    #[error("guarded hiding-FRI commitment was already opened")]
+    AlreadyOpened,
+    /// Public proof metadata could not be reserved.
+    #[error("guarded hiding-FRI opening allocation failed")]
+    AllocationFailed,
+    /// The inner guarded two-adic PCS opening failed.
+    #[error("guarded hiding-FRI inner opening failed")]
+    Inner(#[from] SecretTwoAdicPcsOpenError),
 }
 
 /// A hiding FRI PCS.
@@ -97,14 +192,34 @@ pub struct HidingFriPcs<Val, Dft, InputMmcs, FriMmcs, R> {
 }
 
 /// Prover data whose private masks can be used in only one opening proof.
-/// Clones share the consumed flag; public preprocessing remains reusable.
-#[derive(Clone, Debug)]
+///
+/// In the standard memory capability, clones share the consumed flag and
+/// public preprocessing remains reusable. The `secret-memory` capability
+/// deliberately removes `Clone` and `Debug`; copying or formatting this owner
+/// would undermine its secret-lifecycle contract.
+#[cfg_attr(not(feature = "secret-memory"), derive(Clone, Debug))]
 pub struct HidingFriPcsProverData<T> {
     inner: T,
     preprocessed: bool,
     num_random_codewords: usize,
     log_blowup: usize,
     opened: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "secret-memory")]
+impl<T> zeroize::Zeroize for HidingFriPcsProverData<T>
+where
+    T: zeroize::Zeroize,
+{
+    fn zeroize(&mut self) {
+        self.inner.zeroize();
+        self.preprocessed = false;
+        self.num_random_codewords.zeroize();
+        self.log_blowup.zeroize();
+        // A wiped private commitment must remain unusable. Marking it opened is
+        // fail-closed if a caller retains the shell after explicit erasure.
+        self.opened.store(true, Ordering::SeqCst);
+    }
 }
 
 impl<T> HidingFriPcsProverData<T> {
@@ -214,6 +329,34 @@ where
             "hiding prover data blowup does not match PCS configuration"
         );
     }
+
+    #[cfg(feature = "secret-memory")]
+    const fn check_secret_prover_data_config<T, InnerError>(
+        &self,
+        prover_data: &HidingFriPcsProverData<T>,
+    ) -> Result<(), SecretHidingFriEvaluationError<InnerError>> {
+        if prover_data.num_random_codewords != self.num_random_codewords {
+            return Err(SecretHidingFriEvaluationError::RandomCodewordCountMismatch);
+        }
+        if prover_data.log_blowup != self.inner.fri.log_blowup {
+            return Err(SecretHidingFriEvaluationError::BlowupMismatch);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "secret-memory")]
+    const fn check_secret_open_config<T>(
+        &self,
+        prover_data: &HidingFriPcsProverData<T>,
+    ) -> Result<(), SecretHidingFriOpenError> {
+        if prover_data.num_random_codewords != self.num_random_codewords {
+            return Err(SecretHidingFriOpenError::RandomCodewordCountMismatch);
+        }
+        if prover_data.log_blowup != self.inner.fri.log_blowup {
+            return Err(SecretHidingFriOpenError::BlowupMismatch);
+        }
+        Ok(())
+    }
 }
 
 impl<Val, Dft, InputMmcs, FriMmcs, Challenge, Challenger, R> Pcs<Challenge, Challenger>
@@ -309,6 +452,1507 @@ where
         challenger: &mut Challenger,
     ) -> Result<(), Self::Error> {
         self.verify_with_preprocessing(rounds, proof, challenger, None)
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<Val, Dft, InputMmcs, FriMmcs, Challenge, Challenger, R>
+    SecretPcsCommitter<Challenge, Challenger> for HidingFriPcs<Val, Dft, InputMmcs, FriMmcs, R>
+where
+    Val: TwoAdicField + PrimeField64 + zeroize::Zeroize,
+    StandardUniform: Distribution<Val>,
+    Dft: TwoAdicSubgroupDft<Val> + SecretTwoAdicSubgroupDft<Val> + Sync,
+    InputMmcs:
+        HidingMmcs<Val> + Mmcs<Val, MultiProof: Sync, Error: Sync> + SecretRecomputableMmcs<Val>,
+    InputMmcs::AuthenticationData<RowMajorMatrix<Val>>: zeroize::Zeroize,
+    FriMmcs: HidingMmcs<Challenge> + Mmcs<Challenge>,
+    Challenge: TwoAdicField + ExtensionField<Val>,
+    Challenger:
+        FieldChallenger<Val> + CanObserve<FriMmcs::Commitment> + GrindingChallenger<Witness = Val>,
+    R: CryptoRng + Send + Sync,
+{
+    type SecretData = HidingFriPcsProverData<
+        SecretProverData<
+            crate::SecretTwoAdicFriData<
+                Val,
+                InputMmcs::SecretData<RowMajorMatrix<Val>>,
+                InputMmcs::AuthenticationData<RowMajorMatrix<Val>>,
+            >,
+        >,
+    >;
+    type SecretCommitError =
+        SecretHidingFriCommitError<crate::SecretFriCommitError<InputMmcs::SecretError>>;
+
+    fn commit_secret(
+        &self,
+        evaluations: Vec<(Self::Domain, SecretProverData<RowMajorMatrix<Val>>)>,
+    ) -> Result<(Self::Commitment, SecretProverData<Self::SecretData>), Self::SecretCommitError>
+    {
+        for (_, matrix) in &evaluations {
+            if matrix.width == 0 || !matrix.values.len().is_multiple_of(matrix.width) {
+                return Err(SecretMatrixError::InvalidShape.into());
+            }
+            self.check_hiding_budget(matrix.height(), Challenge::DIMENSION, 1)?;
+        }
+
+        let mut randomized_evaluations = Vec::new();
+        randomized_evaluations
+            .try_reserve_exact(evaluations.len())
+            .map_err(|_| SecretHidingFriCommitError::AllocationFailed)?;
+
+        // Mirror the ordinary hiding PCS: advance the shared generator once,
+        // then keep all witness-derived mask generation on the private stream.
+        // This preserves commitment parity while releasing the shared lock
+        // before the guarded DFT and MMCS work begins.
+        let mut rng = StdRng::from_rng(&mut *self.rng.lock());
+        for (domain, mut matrix) in evaluations {
+            let matrix_width = matrix.width();
+            let original_height = matrix.height();
+            let twice_random_codewords = self
+                .num_random_codewords
+                .checked_mul(2)
+                .ok_or(SecretMatrixError::DimensionOverflow)?;
+            let additional_columns = matrix_width
+                .checked_add(twice_random_codewords)
+                .ok_or(SecretMatrixError::DimensionOverflow)?;
+            let randomized_width = matrix_width
+                .checked_add(self.num_random_codewords)
+                .ok_or(SecretMatrixError::DimensionOverflow)?;
+            let randomized_height = original_height
+                .checked_mul(2)
+                .ok_or(SecretMatrixError::DimensionOverflow)?;
+
+            matrix.try_widen_with_random_cols(additional_columns, &mut rng)?;
+            if randomized_width == 0
+                || !matrix.values.len().is_multiple_of(randomized_width)
+                || matrix.values.len() / randomized_width != randomized_height
+            {
+                return Err(SecretMatrixError::InvalidShape.into());
+            }
+            matrix.width = randomized_width;
+            randomized_evaluations.push((domain, matrix));
+        }
+        let (commitment, inner_data) =
+            <TwoAdicFriPcs<Val, Dft, InputMmcs, FriMmcs> as SecretPcsCommitter<
+                Challenge,
+                Challenger,
+            >>::commit_secret(&self.inner, randomized_evaluations)
+            .map_err(SecretHidingFriCommitError::Inner)?;
+
+        Ok((
+            commitment,
+            SecretProverData::new(HidingFriPcsProverData::new(
+                inner_data,
+                false,
+                self.num_random_codewords,
+                self.inner.fri.log_blowup,
+            )),
+        ))
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<Val, Dft, InputMmcs, FriMmcs, Challenge, Challenger, R>
+    SecretDetachedPcsCommitter<Challenge, Challenger>
+    for HidingFriPcs<Val, Dft, InputMmcs, FriMmcs, R>
+where
+    Val: TwoAdicField + PrimeField64 + zeroize::Zeroize,
+    StandardUniform: Distribution<Val>,
+    Dft: TwoAdicSubgroupDft<Val> + SecretTwoAdicSubgroupDft<Val> + Sync,
+    InputMmcs: HidingMmcs<Val>
+        + Mmcs<Val, MultiProof: Sync, Error: Sync>
+        + SecretRecomputableMmcs<Val>
+        + SecretStreamingRecomputableMmcs<Val>,
+    InputMmcs::AuthenticationData<RowMajorMatrix<Val>>: zeroize::Zeroize,
+    FriMmcs: HidingMmcs<Challenge> + Mmcs<Challenge>,
+    Challenge: TwoAdicField + ExtensionField<Val>,
+    Challenger:
+        FieldChallenger<Val> + CanObserve<FriMmcs::Commitment> + GrindingChallenger<Witness = Val>,
+    R: CryptoRng + Send + Sync,
+{
+    fn commit_detached_secret(
+        &self,
+        evaluations: Vec<(Self::Domain, SecretProverData<RowMajorMatrix<Val>>)>,
+    ) -> Result<(Self::Commitment, SecretProverData<Self::SecretData>), Self::SecretCommitError>
+    {
+        let blowup_shift = u32::try_from(self.inner.fri.log_blowup).map_err(|_| {
+            SecretHidingFriCommitError::Inner(crate::SecretFriCommitError::Dft(
+                p3_dft::SecretDftError::SizeOverflow,
+            ))
+        })?;
+        let twice_random_codewords = self
+            .num_random_codewords
+            .checked_mul(2)
+            .ok_or(SecretMatrixError::DimensionOverflow)?;
+        let mut lde_dimensions = Vec::new();
+        lde_dimensions
+            .try_reserve_exact(evaluations.len())
+            .map_err(|_| SecretHidingFriCommitError::AllocationFailed)?;
+        for (domain, matrix) in &evaluations {
+            if matrix.width == 0 || !matrix.values.len().is_multiple_of(matrix.width) {
+                return Err(SecretMatrixError::InvalidShape.into());
+            }
+            let matrix_width = matrix.width();
+            let original_height = matrix.height();
+            let additional_columns = matrix_width
+                .checked_add(twice_random_codewords)
+                .ok_or(SecretMatrixError::DimensionOverflow)?;
+            let physical_width = matrix_width
+                .checked_add(additional_columns)
+                .ok_or(SecretMatrixError::DimensionOverflow)?;
+            original_height
+                .checked_mul(physical_width)
+                .ok_or(SecretMatrixError::DimensionOverflow)?;
+            let randomized_width = matrix_width
+                .checked_add(self.num_random_codewords)
+                .ok_or(SecretMatrixError::DimensionOverflow)?;
+            let randomized_height = original_height
+                .checked_mul(2)
+                .ok_or(SecretMatrixError::DimensionOverflow)?;
+            if domain.size() != randomized_height {
+                return Err(SecretHidingFriCommitError::Inner(
+                    crate::SecretFriCommitError::DomainHeightMismatch,
+                ));
+            }
+            self.check_hiding_budget(original_height, Challenge::DIMENSION, 1)?;
+            let lde_height = randomized_height.checked_shl(blowup_shift).ok_or(
+                SecretHidingFriCommitError::Inner(crate::SecretFriCommitError::Dft(
+                    p3_dft::SecretDftError::SizeOverflow,
+                )),
+            )?;
+            lde_dimensions.push(Dimensions {
+                width: randomized_width,
+                height: lde_height,
+            });
+        }
+
+        let mut lde_stream =
+            <InputMmcs as SecretStreamingRecomputableMmcs<Val>>::begin_streaming_commitment::<
+                RowMajorMatrix<Val>,
+            >(&self.inner.mmcs, lde_dimensions)
+            .map_err(|error| {
+                SecretHidingFriCommitError::Inner(crate::SecretFriCommitError::Mmcs(error))
+            })?;
+        let mut coefficients = Vec::new();
+        coefficients
+            .try_reserve_exact(evaluations.len())
+            .map_err(|_| SecretHidingFriCommitError::AllocationFailed)?;
+
+        // Mirror the ordinary hiding PCS by deriving one private mask stream
+        // for the complete batch. The shared generator is not held while DFTs
+        // or commitment construction run.
+        let mut rng = StdRng::from_rng(&mut *self.rng.lock());
+        for (domain, mut matrix) in evaluations {
+            let matrix_width = matrix.width();
+            let original_height = matrix.height();
+            let additional_columns = matrix_width
+                .checked_add(twice_random_codewords)
+                .ok_or(SecretMatrixError::DimensionOverflow)?;
+            let randomized_width = matrix_width
+                .checked_add(self.num_random_codewords)
+                .ok_or(SecretMatrixError::DimensionOverflow)?;
+            let randomized_height = original_height
+                .checked_mul(2)
+                .ok_or(SecretMatrixError::DimensionOverflow)?;
+
+            matrix.try_widen_with_random_cols(additional_columns, &mut rng)?;
+            if randomized_width == 0
+                || !matrix.values.len().is_multiple_of(randomized_width)
+                || matrix.values.len() / randomized_width != randomized_height
+            {
+                return Err(SecretMatrixError::InvalidShape.into());
+            }
+            matrix.width = randomized_width;
+            let shift = Val::GENERATOR / domain.shift();
+            let matrix_coefficients = self
+                .inner
+                .dft
+                .coset_lde_batch_secret_with_coefficients(
+                    &mut matrix,
+                    self.inner.fri.log_blowup,
+                    shift,
+                )
+                .map_err(|error| {
+                    SecretHidingFriCommitError::Inner(crate::SecretFriCommitError::Dft(error))
+                })?;
+            reverse_matrix_index_bits(&mut matrix);
+            lde_stream.absorb(matrix).map_err(|error| {
+                SecretHidingFriCommitError::Inner(crate::SecretFriCommitError::Mmcs(error))
+            })?;
+            coefficients.push(matrix_coefficients);
+        }
+        let detached = lde_stream.finish().map_err(|error| {
+            SecretHidingFriCommitError::Inner(crate::SecretFriCommitError::Mmcs(error))
+        })?;
+        let inner_data = SecretProverData::new(crate::SecretTwoAdicFriData::new_detached(
+            detached.prover_data,
+            detached.authentication_data,
+            coefficients,
+            self.inner.fri.log_blowup,
+        ));
+
+        Ok((
+            detached.commitment,
+            SecretProverData::new(HidingFriPcsProverData::new(
+                inner_data,
+                false,
+                self.num_random_codewords,
+                self.inner.fri.log_blowup,
+            )),
+        ))
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<Val, Dft, InputMmcs, FriMmcs, Challenge, Challenger, R> SecretPcsOpener<Challenge, Challenger>
+    for HidingFriPcs<Val, Dft, InputMmcs, FriMmcs, R>
+where
+    Val: TwoAdicField + PrimeField64 + zeroize::Zeroize,
+    StandardUniform: Distribution<Val>,
+    Dft: TwoAdicSubgroupDft<Val> + SecretTwoAdicSubgroupDft<Val> + Sync,
+    InputMmcs:
+        HidingMmcs<Val> + Mmcs<Val, MultiProof: Sync, Error: Sync> + SecretRecomputableMmcs<Val>,
+    InputMmcs::AuthenticationData<RowMajorMatrix<Val>>: zeroize::Zeroize,
+    FriMmcs: HidingMmcs<Challenge> + Mmcs<Challenge> + SecretMmcs<Challenge>,
+    Challenge: TwoAdicField + ExtensionField<Val> + zeroize::Zeroize,
+    Challenger:
+        FieldChallenger<Val> + CanObserve<FriMmcs::Commitment> + GrindingChallenger<Witness = Val>,
+    R: CryptoRng + Send + Sync,
+{
+    type SecretOpenError = SecretHidingFriOpenError;
+
+    fn open_secret(
+        &self,
+        requests: Vec<SecretOpeningRequest<'_, Self::SecretData, Challenge>>,
+        challenger: &mut Challenger,
+    ) -> Result<(OpenedValues<Challenge>, Self::Proof), Self::SecretOpenError> {
+        let mut mixed_requests = Vec::new();
+        mixed_requests
+            .try_reserve_exact(requests.len())
+            .map_err(|_| SecretHidingFriOpenError::AllocationFailed)?;
+        mixed_requests.extend(
+            requests
+                .into_iter()
+                .map(SecretPcsMixedOpeningRequest::Private),
+        );
+        <Self as SecretPcsMixedOpener<Challenge, Challenger>>::open_secret_with_public_preprocessing(
+            self,
+            mixed_requests,
+            challenger,
+        )
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<Val, Dft, InputMmcs, FriMmcs, Challenge, Challenger, R>
+    SecretPcsMixedOpener<Challenge, Challenger> for HidingFriPcs<Val, Dft, InputMmcs, FriMmcs, R>
+where
+    Val: TwoAdicField + PrimeField64 + zeroize::Zeroize,
+    StandardUniform: Distribution<Val>,
+    Dft: TwoAdicSubgroupDft<Val> + SecretTwoAdicSubgroupDft<Val> + Sync,
+    InputMmcs:
+        HidingMmcs<Val> + Mmcs<Val, MultiProof: Sync, Error: Sync> + SecretRecomputableMmcs<Val>,
+    InputMmcs::AuthenticationData<RowMajorMatrix<Val>>: zeroize::Zeroize,
+    FriMmcs: HidingMmcs<Challenge> + Mmcs<Challenge> + SecretMmcs<Challenge>,
+    Challenge: TwoAdicField + ExtensionField<Val> + zeroize::Zeroize,
+    Challenger:
+        FieldChallenger<Val> + CanObserve<FriMmcs::Commitment> + GrindingChallenger<Witness = Val>,
+    R: CryptoRng + Send + Sync,
+{
+    fn open_secret_with_public_preprocessing(
+        &self,
+        mut requests: Vec<
+            SecretPcsMixedOpeningRequest<'_, Self::ProverData, Self::SecretData, Challenge>,
+        >,
+        challenger: &mut Challenger,
+    ) -> Result<(OpenedValues<Challenge>, Self::Proof), Self::SecretOpenError> {
+        let mut public_count = 0_usize;
+        for request in &requests {
+            match request {
+                SecretPcsMixedOpeningRequest::Public(request) => {
+                    public_count = public_count
+                        .checked_add(1)
+                        .ok_or(SecretHidingFriOpenError::InvalidPublicPreprocessingLayout)?;
+                    if public_count > 1 || !request.prover_data.preprocessed {
+                        return Err(SecretHidingFriOpenError::InvalidPublicPreprocessingLayout);
+                    }
+                    self.check_secret_open_config(request.prover_data)?;
+                    let matrices = self.inner.mmcs.get_matrices(&request.prover_data.inner);
+                    if matrices.len() != request.points.len() {
+                        return Err(SecretHidingFriOpenError::InvalidShape);
+                    }
+                    for (matrix, opening_points) in matrices.iter().zip(&request.points) {
+                        let height = matrix.height();
+                        if height == 0 || !height.is_power_of_two() {
+                            return Err(SecretHidingFriOpenError::InvalidShape);
+                        }
+                        self.inner
+                            .fri
+                            .validate_input_height(log2_strict_usize(height))
+                            .map_err(HidingFriProverError::from)?;
+                        self.check_hiding_budget(
+                            self.lde_mask_height(height),
+                            Challenge::DIMENSION,
+                            opening_points.len(),
+                        )?;
+                    }
+                }
+                SecretPcsMixedOpeningRequest::Private(request) => {
+                    let prover_data = &**request.prover_data;
+                    if prover_data.preprocessed {
+                        return Err(SecretHidingFriOpenError::PreprocessedData);
+                    }
+                    if prover_data.opened.load(Ordering::Acquire) {
+                        return Err(SecretHidingFriOpenError::AlreadyOpened);
+                    }
+                    self.check_secret_open_config(prover_data)?;
+                    let dimensions = prover_data.inner.retained_lde_dimensions().map_err(
+                        |error| match error {
+                            SecretMatrixError::AllocationFailed => {
+                                SecretHidingFriOpenError::AllocationFailed
+                            }
+                            SecretMatrixError::DimensionOverflow
+                            | SecretMatrixError::InvalidShape => {
+                                SecretHidingFriOpenError::InvalidShape
+                            }
+                        },
+                    )?;
+                    if dimensions.len() != request.points.len() {
+                        return Err(SecretHidingFriOpenError::InvalidShape);
+                    }
+                    for (dimensions, opening_points) in dimensions.iter().zip(&request.points) {
+                        self.inner
+                            .fri
+                            .validate_input_height(log2_strict_usize(dimensions.height))
+                            .map_err(HidingFriProverError::from)?;
+                        self.check_hiding_budget(
+                            self.lde_mask_height(dimensions.height),
+                            Challenge::DIMENSION,
+                            opening_points.len(),
+                        )?;
+                    }
+                }
+            }
+        }
+
+        // All public layout, profile, geometry, and disclosure checks finish
+        // before any private commitment becomes single-use.
+        for request in &requests {
+            if let SecretPcsMixedOpeningRequest::Private(request) = request {
+                request
+                    .prover_data
+                    .opened
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .map_err(|_| SecretHidingFriOpenError::AlreadyOpened)?;
+            }
+        }
+
+        let mut public_rounds = Vec::new();
+        public_rounds
+            .try_reserve_exact(requests.len())
+            .map_err(|_| SecretHidingFriOpenError::AllocationFailed)?;
+        let mut inner_requests = Vec::new();
+        inner_requests
+            .try_reserve_exact(requests.len())
+            .map_err(|_| SecretHidingFriOpenError::AllocationFailed)?;
+        for request in &mut requests {
+            match request {
+                SecretPcsMixedOpeningRequest::Public(request) => {
+                    public_rounds.push(true);
+                    inner_requests.push(SecretPcsMixedOpeningRequest::Public(OpeningRequest {
+                        prover_data: &request.prover_data.inner,
+                        points: core::mem::take(&mut request.points),
+                    }));
+                }
+                SecretPcsMixedOpeningRequest::Private(request) => {
+                    public_rounds.push(false);
+                    inner_requests.push(SecretPcsMixedOpeningRequest::Private(
+                        SecretOpeningRequest {
+                            prover_data: &mut request.prover_data.inner,
+                            points: core::mem::take(&mut request.points),
+                        },
+                    ));
+                }
+            }
+        }
+
+        let (mut opened_values, inner_proof) =
+            <TwoAdicFriPcs<Val, Dft, InputMmcs, FriMmcs> as SecretPcsMixedOpener<
+                Challenge,
+                Challenger,
+            >>::open_secret_with_public_preprocessing(
+                &self.inner, inner_requests, challenger
+            )?;
+        if opened_values.len() != public_rounds.len() {
+            return Err(SecretHidingFriOpenError::InvalidShape);
+        }
+
+        let mut random_opened_values = Vec::new();
+        random_opened_values
+            .try_reserve_exact(opened_values.len())
+            .map_err(|_| SecretHidingFriOpenError::AllocationFailed)?;
+        for (opened_round, is_public) in opened_values.iter_mut().zip(public_rounds) {
+            let random_width = if is_public {
+                0
+            } else {
+                self.num_random_codewords
+            };
+            let mut random_round = Vec::new();
+            random_round
+                .try_reserve_exact(opened_round.len())
+                .map_err(|_| SecretHidingFriOpenError::AllocationFailed)?;
+            for opened_matrix in opened_round {
+                let mut random_matrix = Vec::new();
+                random_matrix
+                    .try_reserve_exact(opened_matrix.len())
+                    .map_err(|_| SecretHidingFriOpenError::AllocationFailed)?;
+                for opened_point in opened_matrix {
+                    let split = opened_point
+                        .len()
+                        .checked_sub(random_width)
+                        .ok_or(SecretHidingFriOpenError::InvalidShape)?;
+                    let mut random_point = Vec::new();
+                    random_point
+                        .try_reserve_exact(random_width)
+                        .map_err(|_| SecretHidingFriOpenError::AllocationFailed)?;
+                    random_point.extend(opened_point.drain(split..));
+                    random_matrix.push(random_point);
+                }
+                random_round.push(random_matrix);
+            }
+            random_opened_values.push(random_round);
+        }
+
+        Ok((opened_values, (random_opened_values, inner_proof)))
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<Val, Dft, InputMmcs, FriMmcs, Challenge, Challenger, R>
+    SecretUnivariateStarkPcsCommitter<Challenge, Challenger>
+    for HidingFriPcs<Val, Dft, InputMmcs, FriMmcs, R>
+where
+    Val: TwoAdicField + PrimeField64 + zeroize::Zeroize,
+    StandardUniform: Distribution<Val>,
+    Dft: TwoAdicSubgroupDft<Val> + SecretTwoAdicSubgroupDft<Val> + Sync,
+    InputMmcs: HidingMmcs<Val>
+        + Mmcs<Val, MultiProof: Sync, Error: Sync>
+        + SecretRecomputableMmcs<Val>
+        + SecretStreamingRecomputableMmcs<Val>,
+    InputMmcs::AuthenticationData<RowMajorMatrix<Val>>: zeroize::Zeroize,
+    FriMmcs: HidingMmcs<Challenge> + Mmcs<Challenge>,
+    Challenge: TwoAdicField + ExtensionField<Val>,
+    Challenger:
+        FieldChallenger<Val> + CanObserve<FriMmcs::Commitment> + GrindingChallenger<Witness = Val>,
+    R: CryptoRng + Send + Sync,
+{
+    fn commit_quotient_secret(
+        &self,
+        quotient_domain: Self::Domain,
+        quotient_evaluations: SecretProverData<RowMajorMatrix<Val>>,
+        num_chunks: usize,
+    ) -> Result<(Self::Commitment, SecretProverData<Self::SecretData>), Self::SecretCommitError>
+    {
+        let mut quotients = Vec::new();
+        quotients
+            .try_reserve_exact(1)
+            .map_err(|_| SecretHidingFriCommitError::AllocationFailed)?;
+        quotients.push(SecretQuotientCommitmentInput::new(
+            quotient_domain,
+            quotient_evaluations,
+            num_chunks,
+        ));
+        <Self as SecretUnivariateStarkPcsCommitter<Challenge, Challenger>>::commit_quotients_secret(
+            self, quotients,
+        )
+    }
+
+    fn commit_quotients_secret(
+        &self,
+        quotients: Vec<SecretQuotientCommitmentInput<Self::Domain, Val>>,
+    ) -> Result<(Self::Commitment, SecretProverData<Self::SecretData>), Self::SecretCommitError>
+    {
+        let mut plans = Vec::new();
+        plans
+            .try_reserve_exact(quotients.len())
+            .map_err(|_| SecretHidingFriCommitError::AllocationFailed)?;
+        for quotient in &quotients {
+            let domain_size = quotient.domain().size();
+            let evaluations = quotient.evaluations();
+            let width = evaluations.width;
+            let num_chunks = quotient.num_chunks();
+            if width == 0 || !evaluations.values.len().is_multiple_of(width) {
+                return Err(SecretMatrixError::InvalidShape.into());
+            }
+            if evaluations.values.len() / width != domain_size {
+                return Err(SecretHidingFriCommitError::Inner(
+                    crate::SecretFriCommitError::DomainHeightMismatch,
+                ));
+            }
+            if num_chunks <= 1
+                || !num_chunks.is_power_of_two()
+                || num_chunks > domain_size
+                || !domain_size.is_multiple_of(num_chunks)
+            {
+                return Err(SecretHidingFriCommitError::Inner(
+                    crate::SecretFriCommitError::InvalidQuotientChunkCount,
+                ));
+            }
+            let expected_len = domain_size
+                .checked_mul(width)
+                .ok_or(SecretMatrixError::DimensionOverflow)?;
+            if evaluations.values.len() != expected_len {
+                return Err(SecretMatrixError::InvalidShape.into());
+            }
+            self.check_hiding_budget(domain_size / num_chunks, Challenge::DIMENSION, 1)?;
+            plans.push(SecretQuotientCommitmentPlan::new(
+                *quotient.domain(),
+                width,
+                num_chunks,
+            ));
+        }
+
+        let mut quotients = quotients.into_iter();
+        match <Self as SecretUnivariateStarkPcsCommitter<Challenge, Challenger>>::commit_generated_quotients_secret(
+            self,
+            plans,
+            |_, _| {
+                quotients.next().map(|quotient| quotient.into_parts().1).ok_or(
+                    SecretHidingFriCommitError::Inner(
+                        crate::SecretFriCommitError::QuotientCountMismatch,
+                    ),
+                )
+            },
+        ) {
+            Ok(output) => Ok(output),
+            Err(SecretGeneratedQuotientCommitError::Generation(error))
+            | Err(SecretGeneratedQuotientCommitError::Commitment(error)) => Err(error),
+        }
+    }
+
+    fn commit_generated_quotients_secret<GenerationError>(
+        &self,
+        plans: Vec<SecretQuotientCommitmentPlan<Self::Domain>>,
+        mut generate: impl FnMut(
+            usize,
+            &SecretQuotientCommitmentPlan<Self::Domain>,
+        )
+            -> Result<SecretProverData<RowMajorMatrix<Val>>, GenerationError>,
+    ) -> SecretGeneratedQuotientCommitmentResult<
+        Self::Commitment,
+        Self::SecretData,
+        GenerationError,
+        Self::SecretCommitError,
+    >
+    where
+        GenerationError: core::fmt::Debug,
+    {
+        if plans.is_empty() {
+            return Err(SecretGeneratedQuotientCommitError::Commitment(
+                SecretHidingFriCommitError::Inner(crate::SecretFriCommitError::EmptyQuotientBatch),
+            ));
+        }
+
+        let mut total_chunks = 0_usize;
+        for plan in &plans {
+            let domain_size = plan.domain().size();
+            let width = plan.width();
+            let num_chunks = plan.num_chunks();
+            if width == 0 {
+                return Err(SecretGeneratedQuotientCommitError::Commitment(
+                    SecretMatrixError::InvalidShape.into(),
+                ));
+            }
+            if num_chunks <= 1
+                || !num_chunks.is_power_of_two()
+                || num_chunks > domain_size
+                || !domain_size.is_multiple_of(num_chunks)
+            {
+                return Err(SecretGeneratedQuotientCommitError::Commitment(
+                    SecretHidingFriCommitError::Inner(
+                        crate::SecretFriCommitError::InvalidQuotientChunkCount,
+                    ),
+                ));
+            }
+            domain_size.checked_mul(width).ok_or_else(|| {
+                SecretGeneratedQuotientCommitError::Commitment(
+                    SecretMatrixError::DimensionOverflow.into(),
+                )
+            })?;
+            self.check_hiding_budget(domain_size / num_chunks, Challenge::DIMENSION, 1)
+                .map_err(|error| {
+                    SecretGeneratedQuotientCommitError::Commitment(
+                        SecretHidingFriCommitError::Hiding(error),
+                    )
+                })?;
+            total_chunks = total_chunks.checked_add(num_chunks).ok_or_else(|| {
+                SecretGeneratedQuotientCommitError::Commitment(
+                    SecretMatrixError::DimensionOverflow.into(),
+                )
+            })?;
+        }
+
+        let added_bits = self.inner.fri.log_blowup.checked_add(1).ok_or_else(|| {
+            SecretGeneratedQuotientCommitError::Commitment(SecretHidingFriCommitError::Inner(
+                crate::SecretFriCommitError::Dft(p3_dft::SecretDftError::SizeOverflow),
+            ))
+        })?;
+        let added_bits_u32 = u32::try_from(added_bits).map_err(|_| {
+            SecretGeneratedQuotientCommitError::Commitment(SecretHidingFriCommitError::Inner(
+                crate::SecretFriCommitError::Dft(p3_dft::SecretDftError::SizeOverflow),
+            ))
+        })?;
+        let mut lde_dimensions = Vec::new();
+        lde_dimensions
+            .try_reserve_exact(total_chunks)
+            .map_err(|_| {
+                SecretGeneratedQuotientCommitError::Commitment(
+                    SecretHidingFriCommitError::AllocationFailed,
+                )
+            })?;
+        for plan in &plans {
+            let randomized_width = plan
+                .width()
+                .checked_add(self.num_random_codewords)
+                .ok_or_else(|| {
+                    SecretGeneratedQuotientCommitError::Commitment(
+                        SecretMatrixError::DimensionOverflow.into(),
+                    )
+                })?;
+            let rows_per_chunk = plan.domain().size() / plan.num_chunks();
+            let lde_height = rows_per_chunk.checked_shl(added_bits_u32).ok_or_else(|| {
+                SecretGeneratedQuotientCommitError::Commitment(SecretHidingFriCommitError::Inner(
+                    crate::SecretFriCommitError::Dft(p3_dft::SecretDftError::SizeOverflow),
+                ))
+            })?;
+            for _ in 0..plan.num_chunks() {
+                lde_dimensions.push(Dimensions {
+                    width: randomized_width,
+                    height: lde_height,
+                });
+            }
+        }
+        let mut lde_stream =
+            <InputMmcs as SecretStreamingRecomputableMmcs<Val>>::begin_streaming_commitment::<
+                RowMajorMatrix<Val>,
+            >(&self.inner.mmcs, lde_dimensions)
+            .map_err(|error| {
+                SecretGeneratedQuotientCommitError::Commitment(SecretHidingFriCommitError::Inner(
+                    crate::SecretFriCommitError::Mmcs(error),
+                ))
+            })?;
+        let mut coefficients = Vec::new();
+        coefficients.try_reserve_exact(total_chunks).map_err(|_| {
+            SecretGeneratedQuotientCommitError::Commitment(
+                SecretHidingFriCommitError::AllocationFailed,
+            )
+        })?;
+
+        for (index, plan) in plans.into_iter().enumerate() {
+            let quotient_evaluations =
+                generate(index, &plan).map_err(SecretGeneratedQuotientCommitError::Generation)?;
+            let (quotient_domain, planned_width, num_chunks) = plan.into_parts();
+            let preparation = (|| -> Result<(), Self::SecretCommitError> {
+                let domain_size = quotient_domain.size();
+                let width = quotient_evaluations.width;
+                if width != planned_width {
+                    return Err(SecretMatrixError::InvalidShape.into());
+                }
+                if width == 0 || !quotient_evaluations.values.len().is_multiple_of(width) {
+                    return Err(SecretMatrixError::InvalidShape.into());
+                }
+                let height = quotient_evaluations.values.len() / width;
+                if height != domain_size {
+                    return Err(SecretHidingFriCommitError::Inner(
+                        crate::SecretFriCommitError::DomainHeightMismatch,
+                    ));
+                }
+                if num_chunks <= 1
+                    || !num_chunks.is_power_of_two()
+                    || num_chunks > domain_size
+                    || !domain_size.is_multiple_of(num_chunks)
+                {
+                    return Err(SecretHidingFriCommitError::Inner(
+                        crate::SecretFriCommitError::InvalidQuotientChunkCount,
+                    ));
+                }
+
+                let expected_len = domain_size
+                    .checked_mul(width)
+                    .ok_or(SecretMatrixError::DimensionOverflow)?;
+                if quotient_evaluations.values.len() != expected_len {
+                    return Err(SecretMatrixError::InvalidShape.into());
+                }
+                let rows_per_chunk = domain_size / num_chunks;
+                self.check_hiding_budget(rows_per_chunk, Challenge::DIMENSION, 1)?;
+                let values_per_chunk = rows_per_chunk
+                    .checked_mul(width)
+                    .ok_or(SecretMatrixError::DimensionOverflow)?;
+                let domains = quotient_domain.split_domains(num_chunks);
+                if domains.len() != num_chunks {
+                    return Err(SecretMatrixError::InvalidShape.into());
+                }
+
+                let mut chunks = Vec::new();
+                chunks
+                    .try_reserve_exact(num_chunks)
+                    .map_err(|_| SecretHidingFriCommitError::AllocationFailed)?;
+                for _ in 0..num_chunks {
+                    let mut values = Vec::new();
+                    values
+                        .try_reserve_exact(values_per_chunk)
+                        .map_err(|_| SecretMatrixError::AllocationFailed)?;
+                    values.resize(values_per_chunk, Val::ZERO);
+                    chunks.push(SecretProverData::new(RowMajorMatrix::new(values, width)));
+                }
+
+                for source_row_index in 0..domain_size {
+                    let chunk_index = source_row_index % num_chunks;
+                    let destination_row_index = source_row_index / num_chunks;
+                    let source_start = source_row_index
+                        .checked_mul(width)
+                        .ok_or(SecretMatrixError::DimensionOverflow)?;
+                    let source_end = source_start
+                        .checked_add(width)
+                        .ok_or(SecretMatrixError::DimensionOverflow)?;
+                    let destination_start = destination_row_index
+                        .checked_mul(width)
+                        .ok_or(SecretMatrixError::DimensionOverflow)?;
+                    let destination_end = destination_start
+                        .checked_add(width)
+                        .ok_or(SecretMatrixError::DimensionOverflow)?;
+                    let source = quotient_evaluations
+                        .values
+                        .get(source_start..source_end)
+                        .ok_or(SecretMatrixError::InvalidShape)?;
+                    let destination = chunks
+                        .get_mut(chunk_index)
+                        .and_then(|chunk| chunk.values.get_mut(destination_start..destination_end))
+                        .ok_or(SecretMatrixError::InvalidShape)?;
+                    destination.copy_from_slice(source);
+                }
+
+                drop(quotient_evaluations);
+
+                let cis = get_zp_cis(&domains);
+                let last_chunk = num_chunks
+                    .checked_sub(1)
+                    .ok_or(SecretMatrixError::DimensionOverflow)?;
+                let last_chunk_ci_inv = cis
+                    .get(last_chunk)
+                    .copied()
+                    .ok_or(SecretMatrixError::InvalidShape)?
+                    .inverse();
+                let mut mul_coeffs = Vec::new();
+                mul_coeffs
+                    .try_reserve_exact(last_chunk)
+                    .map_err(|_| SecretHidingFriCommitError::AllocationFailed)?;
+                for ci in cis.iter().take(last_chunk) {
+                    mul_coeffs.push(*ci * last_chunk_ci_inv);
+                }
+
+                let randomized_width = width
+                    .checked_add(self.num_random_codewords)
+                    .ok_or(SecretMatrixError::DimensionOverflow)?;
+                let random_values_per_chunk = rows_per_chunk
+                    .checked_mul(randomized_width)
+                    .ok_or(SecretMatrixError::DimensionOverflow)?;
+                let mut final_random_values = Vec::new();
+                final_random_values
+                    .try_reserve_exact(random_values_per_chunk)
+                    .map_err(|_| SecretMatrixError::AllocationFailed)?;
+                final_random_values.resize(random_values_per_chunk, Val::ZERO);
+                let mut final_random_values = Some(SecretProverData::new(RowMajorMatrix::new(
+                    final_random_values,
+                    randomized_width,
+                )));
+
+                // One private stream per quotient instance matches the
+                // ordinary `get_quotient_ldes` transition exactly.
+                let mut rng = StdRng::from_rng(&mut *self.rng.lock());
+                for chunk in &mut chunks {
+                    chunk.try_widen_with_random_cols(self.num_random_codewords, &mut rng)?;
+                }
+
+                let added_bits = self.inner.fri.log_blowup.checked_add(1).ok_or(
+                    SecretHidingFriCommitError::Inner(crate::SecretFriCommitError::Dft(
+                        p3_dft::SecretDftError::SizeOverflow,
+                    )),
+                )?;
+                let added_bits_u32 = u32::try_from(added_bits).map_err(|_| {
+                    SecretHidingFriCommitError::Inner(crate::SecretFriCommitError::Dft(
+                        p3_dft::SecretDftError::SizeOverflow,
+                    ))
+                })?;
+                let lde_height = rows_per_chunk.checked_shl(added_bits_u32).ok_or(
+                    SecretHidingFriCommitError::Inner(crate::SecretFriCommitError::Dft(
+                        p3_dft::SecretDftError::SizeOverflow,
+                    )),
+                )?;
+                let rows_per_chunk_u64 = u64::try_from(rows_per_chunk).map_err(|_| {
+                    SecretHidingFriCommitError::Inner(crate::SecretFriCommitError::Dft(
+                        p3_dft::SecretDftError::SizeOverflow,
+                    ))
+                })?;
+
+                for (chunk_index, (domain, mut chunk)) in
+                    domains.into_iter().zip(chunks).enumerate()
+                {
+                    let chunk_random_values = if chunk_index == last_chunk {
+                        final_random_values
+                            .take()
+                            .ok_or(SecretMatrixError::InvalidShape)?
+                    } else {
+                        let random_values = SecretProverData::try_random(
+                            rows_per_chunk,
+                            randomized_width,
+                            &mut rng,
+                        )?;
+                        let mul_coeff = mul_coeffs
+                            .get(chunk_index)
+                            .copied()
+                            .ok_or(SecretMatrixError::InvalidShape)?;
+                        let final_values = final_random_values
+                            .as_mut()
+                            .ok_or(SecretMatrixError::InvalidShape)?;
+                        if final_values.values.len() != random_values.values.len() {
+                            return Err(SecretMatrixError::InvalidShape.into());
+                        }
+                        for (final_value, source_value) in
+                            final_values.values.iter_mut().zip(&random_values.values)
+                        {
+                            *final_value -= *source_value * mul_coeff;
+                        }
+                        random_values
+                    };
+                    let shift = Val::GENERATOR / domain.shift();
+                    self.inner
+                        .dft
+                        .coset_idft_batch_secret(&mut chunk, shift.inverse())
+                        .map_err(|error| {
+                            SecretHidingFriCommitError::Inner(crate::SecretFriCommitError::Dft(
+                                error,
+                            ))
+                        })?;
+                    chunk.try_grow_zeroed_rows(lde_height)?;
+
+                    if chunk_random_values.width != randomized_width
+                        || chunk_random_values.values.len() != random_values_per_chunk
+                    {
+                        return Err(SecretMatrixError::InvalidShape.into());
+                    }
+                    let upper_row_offset = rows_per_chunk
+                        .checked_mul(randomized_width)
+                        .ok_or(SecretMatrixError::DimensionOverflow)?;
+                    let p = shift.exp_u64(rows_per_chunk_u64);
+
+                    for (row, p_i) in Val::GENERATOR.powers().take(rows_per_chunk).enumerate() {
+                        let lower_start = row
+                            .checked_mul(randomized_width)
+                            .ok_or(SecretMatrixError::DimensionOverflow)?;
+                        let lower_end = lower_start
+                            .checked_add(randomized_width)
+                            .ok_or(SecretMatrixError::DimensionOverflow)?;
+                        let upper_start = upper_row_offset
+                            .checked_add(lower_start)
+                            .ok_or(SecretMatrixError::DimensionOverflow)?;
+                        let upper_end = upper_start
+                            .checked_add(randomized_width)
+                            .ok_or(SecretMatrixError::DimensionOverflow)?;
+                        let random_row = chunk_random_values
+                            .values
+                            .get(lower_start..lower_end)
+                            .ok_or(SecretMatrixError::InvalidShape)?;
+                        if lower_end > upper_start || upper_end > chunk.values.len() {
+                            return Err(SecretMatrixError::InvalidShape.into());
+                        }
+                        let (lower_region, upper_region) = chunk.values.split_at_mut(upper_start);
+                        let lower_row = lower_region
+                            .get_mut(lower_start..lower_end)
+                            .ok_or(SecretMatrixError::InvalidShape)?;
+                        let upper_row = upper_region
+                            .get_mut(..randomized_width)
+                            .ok_or(SecretMatrixError::InvalidShape)?;
+                        for ((lower_value, upper_value), random_value) in
+                            lower_row.iter_mut().zip(upper_row).zip(random_row)
+                        {
+                            let mask = p_i * *random_value;
+                            *lower_value -= mask;
+                            *upper_value += p * mask;
+                        }
+                    }
+
+                    let coefficient_height = rows_per_chunk
+                        .checked_mul(2)
+                        .ok_or(SecretMatrixError::DimensionOverflow)?;
+                    let coefficient_len = coefficient_height
+                        .checked_mul(randomized_width)
+                        .ok_or(SecretMatrixError::DimensionOverflow)?;
+                    let coefficient_source = chunk
+                        .values
+                        .get(..coefficient_len)
+                        .ok_or(SecretMatrixError::InvalidShape)?;
+                    let mut coefficient_values = Vec::new();
+                    coefficient_values
+                        .try_reserve_exact(coefficient_len)
+                        .map_err(|_| SecretMatrixError::AllocationFailed)?;
+                    coefficient_values.extend_from_slice(coefficient_source);
+                    coefficients.push(SecretProverData::new(RowMajorMatrix::new(
+                        coefficient_values,
+                        randomized_width,
+                    )));
+
+                    self.inner
+                        .dft
+                        .dft_batch_secret(&mut chunk)
+                        .map_err(|error| {
+                            SecretHidingFriCommitError::Inner(crate::SecretFriCommitError::Dft(
+                                error,
+                            ))
+                        })?;
+                    reverse_matrix_index_bits(&mut chunk);
+                    lde_stream.absorb(chunk).map_err(|error| {
+                        SecretHidingFriCommitError::Inner(crate::SecretFriCommitError::Mmcs(error))
+                    })?;
+                }
+                Ok(())
+            })();
+            preparation.map_err(SecretGeneratedQuotientCommitError::Commitment)?;
+        }
+
+        let detached = lde_stream.finish().map_err(|error| {
+            SecretGeneratedQuotientCommitError::Commitment(SecretHidingFriCommitError::Inner(
+                crate::SecretFriCommitError::Mmcs(error),
+            ))
+        })?;
+        let inner_prover_data = SecretProverData::new(crate::SecretTwoAdicFriData::new_detached(
+            detached.prover_data,
+            detached.authentication_data,
+            coefficients,
+            self.inner.fri.log_blowup,
+        ));
+        Ok((
+            detached.commitment,
+            SecretProverData::new(HidingFriPcsProverData::new(
+                inner_prover_data,
+                false,
+                self.num_random_codewords,
+                self.inner.fri.log_blowup,
+            )),
+        ))
+    }
+
+    fn commit_generated_quotient_chunks_secret<GenerationError>(
+        &self,
+        plans: Vec<SecretQuotientCommitmentPlan<Self::Domain>>,
+        mut generate: impl FnMut(
+            usize,
+            &SecretQuotientCommitmentPlan<Self::Domain>,
+            usize,
+            Self::Domain,
+        )
+            -> Result<SecretProverData<RowMajorMatrix<Val>>, GenerationError>,
+    ) -> SecretGeneratedQuotientCommitmentResult<
+        Self::Commitment,
+        Self::SecretData,
+        GenerationError,
+        Self::SecretCommitError,
+    >
+    where
+        GenerationError: core::fmt::Debug,
+    {
+        if plans.is_empty() {
+            return Err(SecretGeneratedQuotientCommitError::Commitment(
+                SecretHidingFriCommitError::Inner(crate::SecretFriCommitError::EmptyQuotientBatch),
+            ));
+        }
+
+        let mut total_chunks = 0_usize;
+        for plan in &plans {
+            let domain_size = plan.domain().size();
+            let width = plan.width();
+            let num_chunks = plan.num_chunks();
+            if width == 0 {
+                return Err(SecretGeneratedQuotientCommitError::Commitment(
+                    SecretMatrixError::InvalidShape.into(),
+                ));
+            }
+            if num_chunks <= 1
+                || !num_chunks.is_power_of_two()
+                || num_chunks > domain_size
+                || !domain_size.is_multiple_of(num_chunks)
+            {
+                return Err(SecretGeneratedQuotientCommitError::Commitment(
+                    SecretHidingFriCommitError::Inner(
+                        crate::SecretFriCommitError::InvalidQuotientChunkCount,
+                    ),
+                ));
+            }
+            domain_size.checked_mul(width).ok_or_else(|| {
+                SecretGeneratedQuotientCommitError::Commitment(
+                    SecretMatrixError::DimensionOverflow.into(),
+                )
+            })?;
+            self.check_hiding_budget(domain_size / num_chunks, Challenge::DIMENSION, 1)
+                .map_err(|error| {
+                    SecretGeneratedQuotientCommitError::Commitment(
+                        SecretHidingFriCommitError::Hiding(error),
+                    )
+                })?;
+            total_chunks = total_chunks.checked_add(num_chunks).ok_or_else(|| {
+                SecretGeneratedQuotientCommitError::Commitment(
+                    SecretMatrixError::DimensionOverflow.into(),
+                )
+            })?;
+        }
+
+        let added_bits = self.inner.fri.log_blowup.checked_add(1).ok_or_else(|| {
+            SecretGeneratedQuotientCommitError::Commitment(SecretHidingFriCommitError::Inner(
+                crate::SecretFriCommitError::Dft(p3_dft::SecretDftError::SizeOverflow),
+            ))
+        })?;
+        let added_bits_u32 = u32::try_from(added_bits).map_err(|_| {
+            SecretGeneratedQuotientCommitError::Commitment(SecretHidingFriCommitError::Inner(
+                crate::SecretFriCommitError::Dft(p3_dft::SecretDftError::SizeOverflow),
+            ))
+        })?;
+        let mut lde_dimensions = Vec::new();
+        lde_dimensions
+            .try_reserve_exact(total_chunks)
+            .map_err(|_| {
+                SecretGeneratedQuotientCommitError::Commitment(
+                    SecretHidingFriCommitError::AllocationFailed,
+                )
+            })?;
+        for plan in &plans {
+            let randomized_width = plan
+                .width()
+                .checked_add(self.num_random_codewords)
+                .ok_or_else(|| {
+                    SecretGeneratedQuotientCommitError::Commitment(
+                        SecretMatrixError::DimensionOverflow.into(),
+                    )
+                })?;
+            let rows_per_chunk = plan.domain().size() / plan.num_chunks();
+            let lde_height = rows_per_chunk.checked_shl(added_bits_u32).ok_or_else(|| {
+                SecretGeneratedQuotientCommitError::Commitment(SecretHidingFriCommitError::Inner(
+                    crate::SecretFriCommitError::Dft(p3_dft::SecretDftError::SizeOverflow),
+                ))
+            })?;
+            for _ in 0..plan.num_chunks() {
+                lde_dimensions.push(Dimensions {
+                    width: randomized_width,
+                    height: lde_height,
+                });
+            }
+        }
+        let mut lde_stream =
+            <InputMmcs as SecretStreamingRecomputableMmcs<Val>>::begin_streaming_commitment::<
+                RowMajorMatrix<Val>,
+            >(&self.inner.mmcs, lde_dimensions)
+            .map_err(|error| {
+                SecretGeneratedQuotientCommitError::Commitment(SecretHidingFriCommitError::Inner(
+                    crate::SecretFriCommitError::Mmcs(error),
+                ))
+            })?;
+        let mut coefficients = Vec::new();
+        coefficients.try_reserve_exact(total_chunks).map_err(|_| {
+            SecretGeneratedQuotientCommitError::Commitment(
+                SecretHidingFriCommitError::AllocationFailed,
+            )
+        })?;
+
+        for (instance_index, plan) in plans.into_iter().enumerate() {
+            let width = plan.width();
+            let num_chunks = plan.num_chunks();
+            let rows_per_chunk = plan.domain().size() / num_chunks;
+            let expected_len = rows_per_chunk.checked_mul(width).ok_or_else(|| {
+                SecretGeneratedQuotientCommitError::Commitment(
+                    SecretMatrixError::DimensionOverflow.into(),
+                )
+            })?;
+            let domains = plan.domain().split_domains(num_chunks);
+            if domains.len() != num_chunks {
+                return Err(SecretGeneratedQuotientCommitError::Commitment(
+                    SecretMatrixError::InvalidShape.into(),
+                ));
+            }
+
+            // Acquire the complete instance before advancing the hiding RNG.
+            // The batch generator writes directly into these final chunk
+            // owners, so this does not recreate a full quotient allocation.
+            let mut chunks = Vec::new();
+            chunks.try_reserve_exact(num_chunks).map_err(|_| {
+                SecretGeneratedQuotientCommitError::Commitment(
+                    SecretHidingFriCommitError::AllocationFailed,
+                )
+            })?;
+            for (chunk_index, domain) in domains.iter().copied().enumerate() {
+                let chunk = generate(instance_index, &plan, chunk_index, domain)
+                    .map_err(SecretGeneratedQuotientCommitError::Generation)?;
+                if chunk.width != width || chunk.values.len() != expected_len {
+                    return Err(SecretGeneratedQuotientCommitError::Commitment(
+                        SecretMatrixError::InvalidShape.into(),
+                    ));
+                }
+                chunks.push(chunk);
+            }
+
+            let preparation = (|| -> Result<(), Self::SecretCommitError> {
+                let cis = get_zp_cis(&domains);
+                let last_chunk = num_chunks
+                    .checked_sub(1)
+                    .ok_or(SecretMatrixError::DimensionOverflow)?;
+                let last_chunk_ci_inv = cis
+                    .get(last_chunk)
+                    .copied()
+                    .ok_or(SecretMatrixError::InvalidShape)?
+                    .inverse();
+                let mut mul_coeffs = Vec::new();
+                mul_coeffs
+                    .try_reserve_exact(last_chunk)
+                    .map_err(|_| SecretHidingFriCommitError::AllocationFailed)?;
+                for ci in cis.iter().take(last_chunk) {
+                    mul_coeffs.push(*ci * last_chunk_ci_inv);
+                }
+
+                let randomized_width = width
+                    .checked_add(self.num_random_codewords)
+                    .ok_or(SecretMatrixError::DimensionOverflow)?;
+                let random_values_per_chunk = rows_per_chunk
+                    .checked_mul(randomized_width)
+                    .ok_or(SecretMatrixError::DimensionOverflow)?;
+                let mut final_random_values = Vec::new();
+                final_random_values
+                    .try_reserve_exact(random_values_per_chunk)
+                    .map_err(|_| SecretMatrixError::AllocationFailed)?;
+                final_random_values.resize(random_values_per_chunk, Val::ZERO);
+                let mut final_random_values = Some(SecretProverData::new(RowMajorMatrix::new(
+                    final_random_values,
+                    randomized_width,
+                )));
+
+                // One private stream per quotient instance matches the
+                // ordinary `get_quotient_ldes` transition exactly.
+                let mut rng = StdRng::from_rng(&mut *self.rng.lock());
+                for chunk in &mut chunks {
+                    chunk.try_widen_with_random_cols(self.num_random_codewords, &mut rng)?;
+                }
+
+                let lde_height = rows_per_chunk.checked_shl(added_bits_u32).ok_or(
+                    SecretHidingFriCommitError::Inner(crate::SecretFriCommitError::Dft(
+                        p3_dft::SecretDftError::SizeOverflow,
+                    )),
+                )?;
+                let rows_per_chunk_u64 = u64::try_from(rows_per_chunk).map_err(|_| {
+                    SecretHidingFriCommitError::Inner(crate::SecretFriCommitError::Dft(
+                        p3_dft::SecretDftError::SizeOverflow,
+                    ))
+                })?;
+
+                for (chunk_index, (domain, mut chunk)) in
+                    domains.into_iter().zip(chunks).enumerate()
+                {
+                    let chunk_random_values = if chunk_index == last_chunk {
+                        final_random_values
+                            .take()
+                            .ok_or(SecretMatrixError::InvalidShape)?
+                    } else {
+                        let random_values = SecretProverData::try_random(
+                            rows_per_chunk,
+                            randomized_width,
+                            &mut rng,
+                        )?;
+                        let mul_coeff = mul_coeffs
+                            .get(chunk_index)
+                            .copied()
+                            .ok_or(SecretMatrixError::InvalidShape)?;
+                        let final_values = final_random_values
+                            .as_mut()
+                            .ok_or(SecretMatrixError::InvalidShape)?;
+                        if final_values.values.len() != random_values.values.len() {
+                            return Err(SecretMatrixError::InvalidShape.into());
+                        }
+                        for (final_value, source_value) in
+                            final_values.values.iter_mut().zip(&random_values.values)
+                        {
+                            *final_value -= *source_value * mul_coeff;
+                        }
+                        random_values
+                    };
+                    let shift = Val::GENERATOR / domain.shift();
+                    self.inner
+                        .dft
+                        .coset_idft_batch_secret(&mut chunk, shift.inverse())
+                        .map_err(|error| {
+                            SecretHidingFriCommitError::Inner(crate::SecretFriCommitError::Dft(
+                                error,
+                            ))
+                        })?;
+                    chunk.try_grow_zeroed_rows(lde_height)?;
+
+                    if chunk_random_values.width != randomized_width
+                        || chunk_random_values.values.len() != random_values_per_chunk
+                    {
+                        return Err(SecretMatrixError::InvalidShape.into());
+                    }
+                    let upper_row_offset = rows_per_chunk
+                        .checked_mul(randomized_width)
+                        .ok_or(SecretMatrixError::DimensionOverflow)?;
+                    let p = shift.exp_u64(rows_per_chunk_u64);
+
+                    for (row, p_i) in Val::GENERATOR.powers().take(rows_per_chunk).enumerate() {
+                        let lower_start = row
+                            .checked_mul(randomized_width)
+                            .ok_or(SecretMatrixError::DimensionOverflow)?;
+                        let lower_end = lower_start
+                            .checked_add(randomized_width)
+                            .ok_or(SecretMatrixError::DimensionOverflow)?;
+                        let upper_start = upper_row_offset
+                            .checked_add(lower_start)
+                            .ok_or(SecretMatrixError::DimensionOverflow)?;
+                        let upper_end = upper_start
+                            .checked_add(randomized_width)
+                            .ok_or(SecretMatrixError::DimensionOverflow)?;
+                        let random_row = chunk_random_values
+                            .values
+                            .get(lower_start..lower_end)
+                            .ok_or(SecretMatrixError::InvalidShape)?;
+                        if lower_end > upper_start || upper_end > chunk.values.len() {
+                            return Err(SecretMatrixError::InvalidShape.into());
+                        }
+                        let (lower_region, upper_region) = chunk.values.split_at_mut(upper_start);
+                        let lower_row = lower_region
+                            .get_mut(lower_start..lower_end)
+                            .ok_or(SecretMatrixError::InvalidShape)?;
+                        let upper_row = upper_region
+                            .get_mut(..randomized_width)
+                            .ok_or(SecretMatrixError::InvalidShape)?;
+                        for ((lower_value, upper_value), random_value) in
+                            lower_row.iter_mut().zip(upper_row).zip(random_row)
+                        {
+                            let mask = p_i * *random_value;
+                            *lower_value -= mask;
+                            *upper_value += p * mask;
+                        }
+                    }
+
+                    let coefficient_height = rows_per_chunk
+                        .checked_mul(2)
+                        .ok_or(SecretMatrixError::DimensionOverflow)?;
+                    let coefficient_len = coefficient_height
+                        .checked_mul(randomized_width)
+                        .ok_or(SecretMatrixError::DimensionOverflow)?;
+                    let coefficient_source = chunk
+                        .values
+                        .get(..coefficient_len)
+                        .ok_or(SecretMatrixError::InvalidShape)?;
+                    let mut coefficient_values = Vec::new();
+                    coefficient_values
+                        .try_reserve_exact(coefficient_len)
+                        .map_err(|_| SecretMatrixError::AllocationFailed)?;
+                    coefficient_values.extend_from_slice(coefficient_source);
+                    coefficients.push(SecretProverData::new(RowMajorMatrix::new(
+                        coefficient_values,
+                        randomized_width,
+                    )));
+
+                    self.inner
+                        .dft
+                        .dft_batch_secret(&mut chunk)
+                        .map_err(|error| {
+                            SecretHidingFriCommitError::Inner(crate::SecretFriCommitError::Dft(
+                                error,
+                            ))
+                        })?;
+                    reverse_matrix_index_bits(&mut chunk);
+                    lde_stream.absorb(chunk).map_err(|error| {
+                        SecretHidingFriCommitError::Inner(crate::SecretFriCommitError::Mmcs(error))
+                    })?;
+                }
+                Ok(())
+            })();
+            preparation.map_err(SecretGeneratedQuotientCommitError::Commitment)?;
+        }
+
+        let detached = lde_stream.finish().map_err(|error| {
+            SecretGeneratedQuotientCommitError::Commitment(SecretHidingFriCommitError::Inner(
+                crate::SecretFriCommitError::Mmcs(error),
+            ))
+        })?;
+        let inner_prover_data = SecretProverData::new(crate::SecretTwoAdicFriData::new_detached(
+            detached.prover_data,
+            detached.authentication_data,
+            coefficients,
+            self.inner.fri.log_blowup,
+        ));
+        Ok((
+            detached.commitment,
+            SecretProverData::new(HidingFriPcsProverData::new(
+                inner_prover_data,
+                false,
+                self.num_random_codewords,
+                self.inner.fri.log_blowup,
+            )),
+        ))
+    }
+
+    fn get_opt_randomization_poly_commitment_secret(
+        &self,
+        ext_trace_domains: impl IntoIterator<Item = Self::Domain>,
+    ) -> Result<
+        Option<(Self::Commitment, SecretProverData<Self::SecretData>)>,
+        Self::SecretCommitError,
+    > {
+        let mut domains = Vec::new();
+        for domain in ext_trace_domains {
+            domains
+                .try_reserve(1)
+                .map_err(|_| SecretHidingFriCommitError::AllocationFailed)?;
+            domains.push(domain);
+        }
+        for domain in &domains {
+            self.check_hiding_budget(domain.size() / 2, Challenge::DIMENSION, 1)?;
+        }
+
+        // Finish every profile and shape calculation before advancing the
+        // prover RNG. A rejected batch must not perturb later commitments.
+        let width = self
+            .num_random_codewords
+            .checked_add(Challenge::DIMENSION)
+            .ok_or(SecretMatrixError::DimensionOverflow)?;
+        let mut evaluations = Vec::new();
+        evaluations
+            .try_reserve_exact(domains.len())
+            .map_err(|_| SecretHidingFriCommitError::AllocationFailed)?;
+
+        let mut rng = self.rng.lock();
+        for domain in domains {
+            // The allocation is guarded while it still contains only public
+            // zeroes; random values are written only after ownership exists.
+            let matrix = SecretProverData::try_random(domain.size(), width, &mut *rng)?;
+            evaluations.push((domain, matrix));
+        }
+        drop(rng);
+
+        let (commitment, inner_data) =
+            <TwoAdicFriPcs<Val, Dft, InputMmcs, FriMmcs> as SecretPcsCommitter<
+                Challenge,
+                Challenger,
+            >>::commit_secret(&self.inner, evaluations)
+            .map_err(SecretHidingFriCommitError::Inner)?;
+
+        Ok(Some((
+            commitment,
+            SecretProverData::new(HidingFriPcsProverData::new(
+                inner_data,
+                false,
+                self.num_random_codewords,
+                self.inner.fri.log_blowup,
+            )),
+        )))
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<Val, Dft, InputMmcs, FriMmcs, Challenge, Challenger, R>
+    SecretUnivariateStarkPcsEvaluator<Challenge, Challenger>
+    for HidingFriPcs<Val, Dft, InputMmcs, FriMmcs, R>
+where
+    Val: TwoAdicField + PrimeField64 + zeroize::Zeroize,
+    StandardUniform: Distribution<Val>,
+    Dft: TwoAdicSubgroupDft<Val> + SecretTwoAdicSubgroupDft<Val> + Sync,
+    InputMmcs:
+        HidingMmcs<Val> + Mmcs<Val, MultiProof: Sync, Error: Sync> + SecretRecomputableMmcs<Val>,
+    InputMmcs::AuthenticationData<RowMajorMatrix<Val>>: zeroize::Zeroize,
+    FriMmcs: HidingMmcs<Challenge> + Mmcs<Challenge>,
+    Challenge: TwoAdicField + ExtensionField<Val>,
+    Challenger:
+        FieldChallenger<Val> + CanObserve<FriMmcs::Commitment> + GrindingChallenger<Witness = Val>,
+    R: CryptoRng + Send + Sync,
+{
+    type SecretEvaluationError = SecretHidingFriEvaluationError<crate::SecretFriEvaluationError>;
+
+    fn get_evaluations_on_domain_secret(
+        &self,
+        prover_data: &SecretProverData<Self::SecretData>,
+        idx: usize,
+        domain: Self::Domain,
+    ) -> Result<SecretProverData<RowMajorMatrix<Val>>, Self::SecretEvaluationError> {
+        self.check_secret_prover_data_config(prover_data)?;
+        let mut evaluations =
+            <TwoAdicFriPcs<Val, Dft, InputMmcs, FriMmcs> as SecretUnivariateStarkPcsEvaluator<
+                Challenge,
+                Challenger,
+            >>::get_evaluations_on_domain_secret(
+                &self.inner, &prover_data.inner, idx, domain
+            )
+            .map_err(SecretHidingFriEvaluationError::Inner)?;
+        let public_width = evaluations
+            .width
+            .checked_sub(self.num_random_codewords)
+            .ok_or(SecretHidingFriEvaluationError::InvalidRandomizedWidth)?;
+        if public_width == 0 {
+            return Err(SecretHidingFriEvaluationError::InvalidRandomizedWidth);
+        }
+        evaluations.try_truncate_columns(public_width)?;
+        Ok(evaluations)
+    }
+
+    fn get_source_evaluations_secret(
+        &self,
+        prover_data: &SecretProverData<Self::SecretData>,
+        idx: usize,
+        source_domain: Self::Domain,
+        committed_domain: Self::Domain,
+    ) -> Result<SecretProverData<RowMajorMatrix<Val>>, Self::SecretEvaluationError> {
+        self.check_secret_prover_data_config(prover_data)?;
+        let expected_committed_size = source_domain
+            .size()
+            .checked_mul(2)
+            .ok_or(SecretMatrixError::DimensionOverflow)?;
+        if committed_domain.size() != expected_committed_size
+            || committed_domain.shift() != source_domain.shift()
+        {
+            return Err(SecretMatrixError::InvalidShape.into());
+        }
+
+        let mut randomized =
+            <TwoAdicFriPcs<Val, Dft, InputMmcs, FriMmcs> as SecretUnivariateStarkPcsEvaluator<
+                Challenge,
+                Challenger,
+            >>::get_evaluations_on_domain_secret(
+                &self.inner,
+                &prover_data.inner,
+                idx,
+                committed_domain,
+            )
+            .map_err(SecretHidingFriEvaluationError::Inner)?;
+        let public_width = randomized
+            .width
+            .checked_sub(self.num_random_codewords)
+            .ok_or(SecretHidingFriEvaluationError::InvalidRandomizedWidth)?;
+        if public_width == 0 {
+            return Err(SecretHidingFriEvaluationError::InvalidRandomizedWidth);
+        }
+        randomized.try_truncate_columns(public_width)?;
+        randomized
+            .try_select_strided_rows(0, 2, source_domain.size())
+            .map_err(SecretHidingFriEvaluationError::Matrix)
+    }
+
+    fn get_evaluations_on_domain_no_random_secret(
+        &self,
+        prover_data: &SecretProverData<Self::SecretData>,
+        idx: usize,
+        domain: Self::Domain,
+    ) -> Result<SecretProverData<RowMajorMatrix<Val>>, Self::SecretEvaluationError> {
+        self.check_secret_prover_data_config(prover_data)?;
+        <TwoAdicFriPcs<Val, Dft, InputMmcs, FriMmcs> as SecretUnivariateStarkPcsEvaluator<
+            Challenge,
+            Challenger,
+        >>::get_evaluations_on_domain_secret(&self.inner, &prover_data.inner, idx, domain)
+        .map_err(SecretHidingFriEvaluationError::Inner)
     }
 }
 
@@ -830,18 +2474,102 @@ mod tests {
     use alloc::vec;
     use core::convert::Infallible;
     use core::sync::atomic::AtomicUsize;
+    #[cfg(feature = "secret-memory")]
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use p3_baby_bear::{BabyBear, Poseidon2BabyBear};
     use p3_challenger::DuplexChallenger;
     use p3_commit::ExtensionMmcs;
+    #[cfg(feature = "secret-memory")]
+    use p3_commit::{
+        SecretDetachedPcsCommitter, SecretPcsCommitter, SecretPcsMixedOpener,
+        SecretPcsMixedOpeningRequest, SecretPcsOpener, SecretProverData,
+        SecretUnivariateStarkPcsCommitter, SecretUnivariateStarkPcsEvaluator,
+    };
     use p3_dft::{Radix2Bowers, Radix2DFTSmallBatch, Radix2Dit, Radix2DitParallel};
     use p3_field::extension::BinomialExtensionField;
     use p3_field::{Field, PrimeCharacteristicRing};
     use p3_merkle_tree::MerkleTreeHidingMmcs;
     use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
-    use rand::rngs::SmallRng;
-    use rand::{SeedableRng, TryCryptoRng, TryRng};
+    use rand::rngs::{SmallRng, StdRng};
+    use rand::{RngExt, SeedableRng, TryCryptoRng, TryRng};
     use spin::Once;
+
+    #[cfg(feature = "secret-memory")]
+    struct BorrowedCanary<'a>(&'a mut [u32]);
+
+    #[cfg(feature = "secret-memory")]
+    impl zeroize::Zeroize for BorrowedCanary<'_> {
+        fn zeroize(&mut self) {
+            self.0.fill(0);
+        }
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn hiding_prover_data_zeroize_erases_inner_data_and_fails_closed() {
+        let mut canary = [0xdead_beef_u32, 0x5245_414c, 0x4c59_4d45, 0x0102_0304];
+        {
+            let mut prover_data =
+                HidingFriPcsProverData::new(BorrowedCanary(&mut canary), false, 8, 3);
+
+            zeroize::Zeroize::zeroize(&mut prover_data);
+
+            assert!(prover_data.opened.load(Ordering::SeqCst));
+            assert_eq!(prover_data.num_random_codewords, 0);
+            assert_eq!(prover_data.log_blowup, 0);
+        }
+        assert_eq!(canary, [0_u32; 4]);
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn hiding_prover_data_owner_erases_inner_data_on_normal_drop() {
+        let mut canary = [0xdead_beef_u32, 0x5245_414c, 0x4c59_4d45, 0x0102_0304];
+        {
+            let prover_data = HidingFriPcsProverData::new(
+                BorrowedCanary(&mut canary),
+                false,
+                NUM_RANDOM_CODEWORDS,
+                3,
+            );
+            let _owner = SecretProverData::new(prover_data);
+        }
+
+        assert_eq!(canary, [0_u32; 4]);
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn repeated_hiding_prover_data_owners_erase_independently() {
+        for marker in [0x1111_1111_u32, 0x2222_2222, 0x3333_3333] {
+            let mut canary = [marker, 0xdead_beef, 0x5245_414c, 0x4c59_4d45];
+            {
+                let prover_data = HidingFriPcsProverData::new(
+                    BorrowedCanary(&mut canary),
+                    false,
+                    NUM_RANDOM_CODEWORDS,
+                    3,
+                );
+                let _owner = SecretProverData::new(prover_data);
+            }
+            assert_eq!(canary, [0_u32; 4]);
+        }
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn hiding_prover_data_owner_erases_inner_data_during_unwind() {
+        let mut canary = [0xdead_beef_u32, 0x5245_414c, 0x4c59_4d45, 0x0102_0304];
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let prover_data = HidingFriPcsProverData::new(BorrowedCanary(&mut canary), false, 8, 3);
+            let _owner = SecretProverData::new(prover_data);
+            panic!("exercise hiding prover-data unwind cleanup");
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(canary, [0_u32; 4]);
+    }
 
     use super::*;
 
@@ -865,6 +2593,8 @@ mod tests {
     type Dft = Radix2Dit<Val>;
     type Challenger = DuplexChallenger<Val, Perm, 16, 8>;
     type MyPcs = HidingFriPcs<Val, Dft, ValMmcs, ChallengeMmcs, StdRng>;
+    #[cfg(feature = "secret-memory")]
+    type SecretHidingPcs = HidingFriPcs<Val, Radix2Bowers, ValMmcs, ChallengeMmcs, StdRng>;
     /// Same wrapper, left generic over the DFT backend.
     type HidingPcs<D> = HidingFriPcs<Val, D, ValMmcs, ChallengeMmcs, StdRng>;
     type Commitment = <ValMmcs as Mmcs<Val>>::Commitment;
@@ -882,6 +2612,1303 @@ mod tests {
     /// hidden part (`proof.0`) — the split `verify` re-merges and whose shape the
     /// new error variants guard.
     const NUM_RANDOM_CODEWORDS: usize = 4;
+
+    #[cfg(feature = "secret-memory")]
+    fn make_secret_hiding_pcs(num_random_codewords: usize) -> SecretHidingPcs {
+        let mut parameter_rng = SmallRng::seed_from_u64(0x5345_4352_4554_4849);
+        let permutation = Perm::new_from_rng_128(&mut parameter_rng);
+        let hash = MyHash::new(permutation.clone());
+        let compress = MyCompress::new(permutation);
+        let val_mmcs = ValMmcs::new(
+            hash.clone(),
+            compress.clone(),
+            0,
+            StdRng::seed_from_u64(0x5641_4c5f_4d4d_4353),
+        );
+        let challenge_mmcs = ChallengeMmcs::new(ValMmcs::new(
+            hash,
+            compress,
+            0,
+            StdRng::seed_from_u64(0x4348_414c_4d4d_4353),
+        ));
+        SecretHidingPcs::new(
+            Radix2Bowers,
+            val_mmcs,
+            FriParameters {
+                log_blowup: 1,
+                log_final_poly_len: 0,
+                max_log_arity: 1,
+                num_queries: 2,
+                batch_proof_of_work_bits: 0,
+                commit_proof_of_work_bits: 0,
+                query_proof_of_work_bits: 0,
+                mmcs: challenge_mmcs,
+            },
+            num_random_codewords,
+            StdRng::seed_from_u64(0x4d41_534b_5f52_4e47),
+        )
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_hiding_commit_matches_standard_commit_and_erases_retained_lde() {
+        let standard_pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let guarded_pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let domain = <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(
+            &standard_pcs,
+            32,
+        );
+        let matrix = RowMajorMatrix::new((1_u8..=32).map(Val::from_u8).collect_vec(), 2);
+
+        let (expected_commitment, _standard_data) =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::commit(
+                &standard_pcs,
+                [(domain, matrix.clone())],
+            )
+            .expect("valid standard hiding commitment must succeed");
+        let (commitment, mut prover_data) =
+            <SecretHidingPcs as SecretPcsCommitter<Challenge, Challenger>>::commit_secret(
+                &guarded_pcs,
+                vec![(domain, SecretProverData::new(matrix))],
+            )
+            .expect("valid guarded hiding commitment must succeed");
+        assert_eq!(commitment, expected_commitment);
+
+        zeroize::Zeroize::zeroize(&mut prover_data);
+        let retained = guarded_pcs
+            .inner
+            .mmcs
+            .get_matrices_secret(&prover_data.inner.commitment_data);
+        assert_eq!(retained.len(), 1);
+        assert!(retained[0].values.iter().all(|value| *value == Val::ZERO));
+        assert_eq!(retained[0].width, 0);
+        assert!(prover_data.opened.load(Ordering::SeqCst));
+        assert_eq!(commitment, expected_commitment);
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_hiding_detached_commit_matches_retained_commit_and_rng_state() {
+        let retained_pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let detached_pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let domain = <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(
+            &retained_pcs,
+            32,
+        );
+        let matrices = [2, 3].map(|width| {
+            let value_count = 16_usize
+                .checked_mul(width)
+                .expect("fixed test dimensions must fit");
+            RowMajorMatrix::new(
+                (0..value_count)
+                    .map(|index| Val::from_usize(index + 1))
+                    .collect_vec(),
+                width,
+            )
+        });
+
+        let retained_evaluations = matrices
+            .clone()
+            .into_iter()
+            .map(|matrix| (domain, SecretProverData::new(matrix)))
+            .collect();
+        let (retained_commitment, retained_data) =
+            <SecretHidingPcs as SecretPcsCommitter<Challenge, Challenger>>::commit_secret(
+                &retained_pcs,
+                retained_evaluations,
+            )
+            .expect("valid retained hiding commitment must succeed");
+        let detached_evaluations = matrices
+            .into_iter()
+            .map(|matrix| (domain, SecretProverData::new(matrix)))
+            .collect();
+        let (detached_commitment, detached_data) = <SecretHidingPcs as SecretDetachedPcsCommitter<
+            Challenge,
+            Challenger,
+        >>::commit_detached_secret(&detached_pcs, detached_evaluations)
+        .expect("valid detached hiding commitment must succeed");
+
+        assert_eq!(detached_commitment, retained_commitment);
+        assert!(retained_data.inner.authentication_data.is_none());
+        assert!(detached_data.inner.authentication_data.is_some());
+        assert!(
+            detached_pcs
+                .inner
+                .mmcs
+                .get_matrices_secret(&detached_data.inner.commitment_data)
+                .is_empty()
+        );
+        assert_eq!(
+            detached_pcs.rng.lock().random::<u64>(),
+            retained_pcs.rng.lock().random::<u64>()
+        );
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_hiding_detached_commit_preflights_every_domain_before_rng() {
+        const SOURCE_HEIGHT: usize = 16;
+        const WIDTH: usize = 2;
+        let pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let control = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let valid_domain =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(&pcs, 32);
+        let invalid_domain =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(&pcs, 16);
+        let value_count = SOURCE_HEIGHT
+            .checked_mul(WIDTH)
+            .expect("fixed test dimensions must fit");
+        let first = RowMajorMatrix::new(vec![Val::ONE; value_count], WIDTH);
+        let second = RowMajorMatrix::new(vec![Val::TWO; value_count], WIDTH);
+
+        let result = <SecretHidingPcs as SecretDetachedPcsCommitter<Challenge, Challenger>>::
+            commit_detached_secret(
+                &pcs,
+                vec![
+                    (valid_domain, SecretProverData::new(first)),
+                    (invalid_domain, SecretProverData::new(second)),
+                ],
+            );
+
+        assert!(matches!(
+            result,
+            Err(SecretHidingFriCommitError::Inner(
+                crate::SecretFriCommitError::DomainHeightMismatch
+            ))
+        ));
+        assert_eq!(
+            pcs.rng.lock().random::<u64>(),
+            control.rng.lock().random::<u64>()
+        );
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_hiding_domain_evaluation_matches_ordinary_width_semantics() {
+        const COMMITTED_DOMAIN_SIZE: usize = 32;
+        const TARGET_DOMAIN_SIZE: usize = 64;
+        const PUBLIC_WIDTH: usize = 2;
+        let standard_pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let guarded_pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let domain = <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(
+            &standard_pcs,
+            COMMITTED_DOMAIN_SIZE,
+        );
+        let matrix = RowMajorMatrix::new((1_u8..=32).map(Val::from_u8).collect_vec(), PUBLIC_WIDTH);
+        let (ordinary_commitment, ordinary_data) =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::commit(
+                &standard_pcs,
+                [(domain, matrix.clone())],
+            )
+            .expect("valid ordinary hiding commitment must succeed");
+        let (guarded_commitment, guarded_data) =
+            <SecretHidingPcs as SecretPcsCommitter<Challenge, Challenger>>::commit_secret(
+                &guarded_pcs,
+                vec![(domain, SecretProverData::new(matrix))],
+            )
+            .expect("valid guarded hiding commitment must succeed");
+        assert_eq!(guarded_commitment, ordinary_commitment);
+
+        let target_domain = domain.create_disjoint_domain(TARGET_DOMAIN_SIZE);
+        let expected_public = <SecretHidingPcs as UnivariateStarkPcs<
+            Challenge,
+            Challenger,
+        >>::get_evaluations_on_domain(&standard_pcs, &ordinary_data, 0, target_domain)
+        .to_row_major_matrix();
+        let expected_full = <SecretHidingPcs as UnivariateStarkPcs<Challenge, Challenger>>::get_evaluations_on_domain_no_random(
+            &standard_pcs,
+            &ordinary_data,
+            0,
+            target_domain,
+        )
+        .to_row_major_matrix();
+
+        let actual_public = <SecretHidingPcs as SecretUnivariateStarkPcsEvaluator<
+            Challenge,
+            Challenger,
+        >>::get_evaluations_on_domain_secret(
+            &guarded_pcs, &guarded_data, 0, target_domain
+        )
+        .expect("guarded hiding evaluation must succeed");
+        let actual_full = <SecretHidingPcs as SecretUnivariateStarkPcsEvaluator<
+            Challenge,
+            Challenger,
+        >>::get_evaluations_on_domain_no_random_secret(
+            &guarded_pcs,
+            &guarded_data,
+            0,
+            target_domain,
+        )
+        .expect("guarded untruncated hiding evaluation must succeed");
+
+        assert_eq!(actual_public.width, PUBLIC_WIDTH);
+        assert_eq!(actual_public.values, expected_public.values);
+        assert_eq!(
+            actual_full.width,
+            PUBLIC_WIDTH
+                .checked_add(NUM_RANDOM_CODEWORDS)
+                .expect("fixed test width must fit")
+        );
+        assert_eq!(actual_full.values, expected_full.values);
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_hiding_split_cosets_are_exact_interleaved_full_domain_rows() {
+        const SOURCE_SIZE: usize = 32;
+        const TARGET_SIZE: usize = 128;
+        const NUM_CHUNKS: usize = 8;
+        const PUBLIC_WIDTH: usize = 2;
+
+        let pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let source_domain =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(
+                &pcs,
+                SOURCE_SIZE,
+            );
+        let source_len = (SOURCE_SIZE / 2)
+            .checked_mul(PUBLIC_WIDTH)
+            .expect("fixed test dimensions must fit");
+        let source = RowMajorMatrix::new(
+            (0..source_len)
+                .map(|index| Val::from_usize(index + 1))
+                .collect_vec(),
+            PUBLIC_WIDTH,
+        );
+        let (_, guarded_data) =
+            <SecretHidingPcs as SecretPcsCommitter<Challenge, Challenger>>::commit_secret(
+                &pcs,
+                vec![(source_domain, SecretProverData::new(source))],
+            )
+            .expect("valid guarded hiding commitment must succeed");
+        let full_domain = source_domain.create_disjoint_domain(TARGET_SIZE);
+        let full = <SecretHidingPcs as SecretUnivariateStarkPcsEvaluator<
+            Challenge,
+            Challenger,
+        >>::get_evaluations_on_domain_secret(&pcs, &guarded_data, 0, full_domain)
+        .expect("full guarded hiding evaluation must succeed");
+
+        for (chunk_index, chunk_domain) in full_domain
+            .split_domains(NUM_CHUNKS)
+            .into_iter()
+            .enumerate()
+        {
+            let chunk = <SecretHidingPcs as SecretUnivariateStarkPcsEvaluator<
+                Challenge,
+                Challenger,
+            >>::get_evaluations_on_domain_secret(
+                &pcs, &guarded_data, 0, chunk_domain
+            )
+            .expect("split guarded hiding evaluation must succeed");
+            assert_eq!(chunk.width, PUBLIC_WIDTH);
+            assert_eq!(chunk.height(), TARGET_SIZE / NUM_CHUNKS);
+
+            for local_row in 0..chunk.height() {
+                let full_row = local_row
+                    .checked_mul(NUM_CHUNKS)
+                    .and_then(|row| row.checked_add(chunk_index))
+                    .expect("fixed test row mapping must fit");
+                for column in 0..PUBLIC_WIDTH {
+                    assert_eq!(chunk.get(local_row, column), full.get(full_row, column));
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_hiding_source_reconstruction_removes_interleaved_mask_rows() {
+        const SOURCE_DOMAIN_SIZE: usize = 16;
+        const COMMITTED_DOMAIN_SIZE: usize = SOURCE_DOMAIN_SIZE * 2;
+        const PUBLIC_WIDTH: usize = 2;
+        let pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let source_domain =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(
+                &pcs,
+                SOURCE_DOMAIN_SIZE,
+            );
+        let committed_domain =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(
+                &pcs,
+                COMMITTED_DOMAIN_SIZE,
+            );
+        let matrix = RowMajorMatrix::new((1_u8..=32).map(Val::from_u8).collect_vec(), PUBLIC_WIDTH);
+        let expected = matrix.values.clone();
+        let (_, guarded_data) =
+            <SecretHidingPcs as SecretPcsCommitter<Challenge, Challenger>>::commit_secret(
+                &pcs,
+                vec![(committed_domain, SecretProverData::new(matrix))],
+            )
+            .expect("valid guarded hiding commitment must succeed");
+
+        let reconstructed = <SecretHidingPcs as SecretUnivariateStarkPcsEvaluator<
+            Challenge,
+            Challenger,
+        >>::get_source_evaluations_secret(
+            &pcs, &guarded_data, 0, source_domain, committed_domain
+        )
+        .expect("guarded hiding source reconstruction must succeed");
+
+        assert_eq!(reconstructed.width, PUBLIC_WIDTH);
+        assert_eq!(reconstructed.height(), SOURCE_DOMAIN_SIZE);
+        assert_eq!(reconstructed.values, expected);
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_hiding_source_reconstruction_rejects_domain_mismatch() {
+        const SOURCE_DOMAIN_SIZE: usize = 16;
+        const COMMITTED_DOMAIN_SIZE: usize = SOURCE_DOMAIN_SIZE * 2;
+        let pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let source_domain =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(
+                &pcs,
+                SOURCE_DOMAIN_SIZE,
+            );
+        let committed_domain =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(
+                &pcs,
+                COMMITTED_DOMAIN_SIZE,
+            );
+        let wrong_committed_domain =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(
+                &pcs,
+                COMMITTED_DOMAIN_SIZE * 2,
+            );
+        let matrix = RowMajorMatrix::new(vec![Val::ONE; SOURCE_DOMAIN_SIZE], 1);
+        let (_, guarded_data) =
+            <SecretHidingPcs as SecretPcsCommitter<Challenge, Challenger>>::commit_secret(
+                &pcs,
+                vec![(committed_domain, SecretProverData::new(matrix))],
+            )
+            .expect("valid guarded hiding commitment must succeed");
+
+        let result = <SecretHidingPcs as SecretUnivariateStarkPcsEvaluator<
+            Challenge,
+            Challenger,
+        >>::get_source_evaluations_secret(
+            &pcs,
+            &guarded_data,
+            0,
+            source_domain,
+            wrong_committed_domain,
+        );
+
+        assert!(matches!(
+            result,
+            Err(SecretHidingFriEvaluationError::Matrix(
+                SecretMatrixError::InvalidShape
+            ))
+        ));
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_hiding_domain_evaluation_rejects_profile_drift() {
+        let pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let domain =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(&pcs, 32);
+        let matrix = RowMajorMatrix::new((1_u8..=32).map(Val::from_u8).collect_vec(), 2);
+        let (_, mut guarded_data) =
+            <SecretHidingPcs as SecretPcsCommitter<Challenge, Challenger>>::commit_secret(
+                &pcs,
+                vec![(domain, SecretProverData::new(matrix))],
+            )
+            .expect("valid guarded hiding commitment must succeed");
+        guarded_data.num_random_codewords = guarded_data
+            .num_random_codewords
+            .checked_add(1)
+            .expect("fixed test random-codeword increment must fit");
+
+        let result = <SecretHidingPcs as SecretUnivariateStarkPcsEvaluator<
+            Challenge,
+            Challenger,
+        >>::get_evaluations_on_domain_secret(&pcs, &guarded_data, 0, domain);
+
+        assert!(matches!(
+            result,
+            Err(SecretHidingFriEvaluationError::RandomCodewordCountMismatch)
+        ));
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_hiding_commit_rejects_randomization_dimension_overflow() {
+        let pcs = make_secret_hiding_pcs(usize::MAX);
+        let domain =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(&pcs, 32);
+        let matrix = SecretProverData::new(RowMajorMatrix::new(vec![Val::ONE; 16], 1));
+
+        let result = <SecretHidingPcs as SecretPcsCommitter<Challenge, Challenger>>::commit_secret(
+            &pcs,
+            vec![(domain, matrix)],
+        );
+
+        assert!(matches!(
+            result,
+            Err(SecretHidingFriCommitError::Matrix(
+                SecretMatrixError::DimensionOverflow
+            ))
+        ));
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_hiding_commit_erases_randomized_state_after_inner_error() {
+        let pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let oversized_domain =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(&pcs, 64);
+        let matrix = SecretProverData::new(RowMajorMatrix::new(vec![Val::ONE; 16], 1));
+
+        let result = <SecretHidingPcs as SecretPcsCommitter<Challenge, Challenger>>::commit_secret(
+            &pcs,
+            vec![(oversized_domain, matrix)],
+        );
+
+        assert!(matches!(
+            result,
+            Err(SecretHidingFriCommitError::Inner(
+                crate::SecretFriCommitError::DomainHeightMismatch
+            ))
+        ));
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_hiding_quotient_commit_matches_standard_and_returns_detached() {
+        const DOMAIN_SIZE: usize = 64;
+        const NUM_CHUNKS: usize = 2;
+        const WIDTH: usize = 2;
+
+        let standard_pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let guarded_pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let domain = <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(
+            &standard_pcs,
+            DOMAIN_SIZE,
+        );
+        let values = (0..DOMAIN_SIZE * WIDTH).map(Val::from_usize).collect_vec();
+        let matrix = RowMajorMatrix::new(values, WIDTH);
+
+        let (expected_commitment, _standard_data) =
+            <SecretHidingPcs as UnivariateStarkPcs<Challenge, Challenger>>::commit_quotient(
+                &standard_pcs,
+                domain,
+                matrix.clone(),
+                NUM_CHUNKS,
+            )
+            .expect("valid standard hiding quotient commitment must succeed");
+        let (commitment, mut prover_data) = <SecretHidingPcs as
+            SecretUnivariateStarkPcsCommitter<Challenge, Challenger>>::commit_quotient_secret(
+            &guarded_pcs,
+            domain,
+            SecretProverData::new(matrix),
+            NUM_CHUNKS,
+        )
+        .expect("valid guarded hiding quotient commitment must succeed");
+
+        assert_eq!(commitment, expected_commitment);
+        assert!(
+            guarded_pcs
+                .inner
+                .mmcs
+                .get_matrices_secret(&prover_data.inner.commitment_data)
+                .is_empty()
+        );
+        assert!(prover_data.inner.authentication_data.is_some());
+        assert_eq!(
+            prover_data
+                .inner
+                .retained_lde_dimensions()
+                .expect("valid retained hiding quotient geometry must remain available")
+                .len(),
+            NUM_CHUNKS
+        );
+
+        zeroize::Zeroize::zeroize(&mut prover_data);
+        let retained = guarded_pcs
+            .inner
+            .mmcs
+            .get_matrices_secret(&prover_data.inner.commitment_data);
+        assert!(retained.is_empty());
+        assert!(prover_data.inner.retained_lde_dimensions().is_err());
+        assert!(prover_data.opened.load(Ordering::SeqCst));
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_hiding_quotient_batch_matches_one_standard_global_commitment() {
+        const FIRST_SIZE: usize = 64;
+        const FIRST_CHUNKS: usize = 2;
+        const SECOND_SIZE: usize = 128;
+        const SECOND_CHUNKS: usize = 4;
+
+        let standard_pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let guarded_pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let first_domain =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(
+                &standard_pcs,
+                FIRST_SIZE,
+            );
+        let second_domain =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(
+                &standard_pcs,
+                SECOND_SIZE,
+            );
+        let first = RowMajorMatrix::new((0..FIRST_SIZE).map(Val::from_usize).collect_vec(), 1);
+        let second = RowMajorMatrix::new(
+            (FIRST_SIZE..FIRST_SIZE + SECOND_SIZE * 2)
+                .map(Val::from_usize)
+                .collect_vec(),
+            2,
+        );
+
+        let mut ordinary_ldes = Vec::new();
+        for (domain, matrix, num_chunks) in [
+            (first_domain, first.clone(), FIRST_CHUNKS),
+            (second_domain, second.clone(), SECOND_CHUNKS),
+        ] {
+            let chunk_domains = domain.split_domains(num_chunks);
+            let chunk_matrices = domain.split_evals(num_chunks, matrix);
+            let chunk_ldes =
+                <SecretHidingPcs as UnivariateStarkPcs<Challenge, Challenger>>::get_quotient_ldes(
+                    &standard_pcs,
+                    chunk_domains.into_iter().zip(chunk_matrices),
+                    num_chunks,
+                )
+                .expect("valid ordinary hiding quotient LDE construction must succeed");
+            ordinary_ldes.extend(chunk_ldes);
+        }
+        let (expected_commitment, _ordinary_data) =
+            <SecretHidingPcs as UnivariateStarkPcs<Challenge, Challenger>>::commit_ldes(
+                &standard_pcs,
+                ordinary_ldes,
+            )
+            .expect("valid ordinary hiding global quotient commitment must succeed");
+
+        let (commitment, mut prover_data) = <SecretHidingPcs as
+            SecretUnivariateStarkPcsCommitter<Challenge, Challenger>>::commit_quotients_secret(
+            &guarded_pcs,
+            vec![
+                SecretQuotientCommitmentInput::new(
+                    first_domain,
+                    SecretProverData::new(first),
+                    FIRST_CHUNKS,
+                ),
+                SecretQuotientCommitmentInput::new(
+                    second_domain,
+                    SecretProverData::new(second),
+                    SECOND_CHUNKS,
+                ),
+            ],
+        )
+        .expect("valid guarded hiding quotient batch must succeed");
+
+        assert_eq!(commitment, expected_commitment);
+        let next_domain =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(
+                &standard_pcs,
+                32,
+            );
+        let next_matrix = RowMajorMatrix::new(
+            (0..16)
+                .map(|value| Val::from_usize(value + 7))
+                .collect_vec(),
+            1,
+        );
+        let (expected_next_commitment, _expected_next_data) =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::commit(
+                &standard_pcs,
+                [(next_domain, next_matrix.clone())],
+            )
+            .expect("valid standard commitment after quotient batch must succeed");
+        let (next_commitment, _next_data) =
+            <SecretHidingPcs as SecretPcsCommitter<Challenge, Challenger>>::commit_secret(
+                &guarded_pcs,
+                vec![(next_domain, SecretProverData::new(next_matrix))],
+            )
+            .expect("valid guarded commitment after quotient batch must succeed");
+        assert_eq!(next_commitment, expected_next_commitment);
+        assert!(
+            guarded_pcs
+                .inner
+                .mmcs
+                .get_matrices_secret(&prover_data.inner.commitment_data)
+                .is_empty()
+        );
+        assert!(prover_data.inner.authentication_data.is_some());
+        assert_eq!(
+            prover_data
+                .inner
+                .retained_lde_dimensions()
+                .expect("valid retained hiding quotient geometry must remain available")
+                .len(),
+            FIRST_CHUNKS + SECOND_CHUNKS
+        );
+        zeroize::Zeroize::zeroize(&mut prover_data);
+        let retained = guarded_pcs
+            .inner
+            .mmcs
+            .get_matrices_secret(&prover_data.inner.commitment_data);
+        assert!(retained.is_empty());
+        assert!(prover_data.inner.retained_lde_dimensions().is_err());
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_hiding_quotient_batch_validates_every_input_before_rng() {
+        const DOMAIN_SIZE: usize = 64;
+        const NUM_CHUNKS: usize = 2;
+
+        let rejected_pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let control_pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let domain = <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(
+            &rejected_pcs,
+            DOMAIN_SIZE,
+        );
+        let valid = RowMajorMatrix::new((0..DOMAIN_SIZE).map(Val::from_usize).collect_vec(), 1);
+        let malformed = RowMajorMatrix::new(vec![Val::ONE; DOMAIN_SIZE / 2], 1);
+
+        let mut generation_calls = 0_usize;
+        let invalid_plan = <SecretHidingPcs as SecretUnivariateStarkPcsCommitter<
+            Challenge,
+            Challenger,
+        >>::commit_generated_quotients_secret(
+            &rejected_pcs,
+            vec![
+                SecretQuotientCommitmentPlan::new(domain, 1, NUM_CHUNKS),
+                SecretQuotientCommitmentPlan::new(domain, 1, 1),
+            ],
+            |_, _| {
+                generation_calls += 1;
+                Ok::<_, SecretMatrixError>(SecretProverData::new(valid.clone()))
+            },
+        );
+        assert!(matches!(
+            invalid_plan,
+            Err(SecretGeneratedQuotientCommitError::Commitment(
+                SecretHidingFriCommitError::Inner(
+                    crate::SecretFriCommitError::InvalidQuotientChunkCount
+                )
+            ))
+        ));
+        assert_eq!(generation_calls, 0);
+
+        let rejected = <SecretHidingPcs as SecretUnivariateStarkPcsCommitter<
+            Challenge,
+            Challenger,
+        >>::commit_quotients_secret(
+            &rejected_pcs,
+            vec![
+                SecretQuotientCommitmentInput::new(
+                    domain,
+                    SecretProverData::new(valid.clone()),
+                    NUM_CHUNKS,
+                ),
+                SecretQuotientCommitmentInput::new(
+                    domain,
+                    SecretProverData::new(malformed),
+                    NUM_CHUNKS,
+                ),
+            ],
+        );
+        assert!(matches!(
+            rejected,
+            Err(SecretHidingFriCommitError::Inner(
+                crate::SecretFriCommitError::DomainHeightMismatch
+            ))
+        ));
+
+        let (after_rejection, _after_data) = <SecretHidingPcs as
+            SecretUnivariateStarkPcsCommitter<Challenge, Challenger>>::commit_quotient_secret(
+            &rejected_pcs,
+            domain,
+            SecretProverData::new(valid.clone()),
+            NUM_CHUNKS,
+        )
+        .expect("valid guarded quotient after rejection must succeed");
+        let (control, _control_data) = <SecretHidingPcs as SecretUnivariateStarkPcsCommitter<
+            Challenge,
+            Challenger,
+        >>::commit_quotient_secret(
+            &control_pcs,
+            domain,
+            SecretProverData::new(valid),
+            NUM_CHUNKS,
+        )
+        .expect("valid guarded control quotient must succeed");
+        assert_eq!(after_rejection, control);
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_hiding_randomization_commitment_matches_standard_and_verifies() {
+        let standard_pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let guarded_pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let first_domain =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(
+                &standard_pcs,
+                32,
+            );
+        let second_domain =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(
+                &standard_pcs,
+                64,
+            );
+
+        let (ordinary_commitment, ordinary_data) = <SecretHidingPcs as UnivariateStarkPcs<
+            Challenge,
+            Challenger,
+        >>::get_opt_randomization_poly_commitment(
+            &standard_pcs, [first_domain, second_domain]
+        )
+        .expect("valid standard randomization commitment must succeed")
+        .expect("hiding PCS must produce a randomization commitment");
+        let (commitment, mut guarded_data) = <SecretHidingPcs as
+            SecretUnivariateStarkPcsCommitter<Challenge, Challenger>>::get_opt_randomization_poly_commitment_secret(
+            &guarded_pcs,
+            [first_domain, second_domain],
+        )
+        .expect("valid guarded randomization commitment must succeed")
+        .expect("guarded hiding PCS must produce a randomization commitment");
+        assert_eq!(commitment, ordinary_commitment);
+
+        let mut challenger_rng = SmallRng::seed_from_u64(0x5241_4e44_5f50_4152);
+        let challenger_permutation = Perm::new_from_rng_128(&mut challenger_rng);
+        let mut ordinary_challenger = Challenger::new(challenger_permutation.clone());
+        ordinary_challenger.observe(&ordinary_commitment);
+        let ordinary_zeta: Challenge = ordinary_challenger.sample_algebra_element();
+        let (ordinary_values, ordinary_proof) =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::open(
+                &standard_pcs,
+                vec![
+                    (
+                        &ordinary_data,
+                        vec![vec![ordinary_zeta], vec![ordinary_zeta]],
+                    )
+                        .into(),
+                ],
+                &mut ordinary_challenger,
+            )
+            .expect("valid standard randomization opening must succeed");
+
+        let mut guarded_challenger = Challenger::new(challenger_permutation.clone());
+        guarded_challenger.observe(&commitment);
+        let zeta: Challenge = guarded_challenger.sample_algebra_element();
+        assert_eq!(zeta, ordinary_zeta);
+        let (opened_values, proof) =
+            <SecretHidingPcs as SecretPcsOpener<Challenge, Challenger>>::open_secret(
+                &guarded_pcs,
+                vec![(&mut guarded_data, vec![vec![zeta], vec![zeta]]).into()],
+                &mut guarded_challenger,
+            )
+            .expect("valid guarded randomization opening must succeed");
+
+        assert_eq!(opened_values, ordinary_values);
+        assert_eq!(proof.0, ordinary_proof.0);
+        assert_eq!(
+            proof.1.batch_pow_witness,
+            ordinary_proof.1.batch_pow_witness
+        );
+        assert_eq!(
+            proof.1.commit_phase_commits,
+            ordinary_proof.1.commit_phase_commits
+        );
+        assert_eq!(proof.1.final_poly, ordinary_proof.1.final_poly);
+        assert_eq!(
+            guarded_challenger.sample_algebra_element::<Challenge>(),
+            ordinary_challenger.sample_algebra_element::<Challenge>()
+        );
+
+        let claims: Vec<CommitmentOpening<Challenge, Commitment, Domain>> = vec![
+            (
+                commitment,
+                vec![
+                    (first_domain, vec![(zeta, opened_values[0][0][0].clone())]),
+                    (second_domain, vec![(zeta, opened_values[0][1][0].clone())]),
+                ],
+            )
+                .into(),
+        ];
+        let mut verifier_challenger = Challenger::new(challenger_permutation);
+        verifier_challenger.observe(&claims[0].commitment);
+        let verifier_zeta: Challenge = verifier_challenger.sample_algebra_element();
+        assert_eq!(verifier_zeta, zeta);
+        <SecretHidingPcs as Pcs<Challenge, Challenger>>::verify(
+            &guarded_pcs,
+            claims,
+            &proof,
+            &mut verifier_challenger,
+        )
+        .expect("ordinary hiding verifier must accept guarded randomization proof");
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_hiding_randomization_rejects_all_domains_before_using_rng() {
+        let rejected_pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let control_pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let valid_domain =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(
+                &rejected_pcs,
+                32,
+            );
+        let short_domain = Domain::new(Val::ONE, 2).expect("fixed test domain must be valid");
+
+        let rejected = <SecretHidingPcs as SecretUnivariateStarkPcsCommitter<
+            Challenge,
+            Challenger,
+        >>::get_opt_randomization_poly_commitment_secret(
+            &rejected_pcs,
+            [valid_domain, short_domain],
+        );
+        assert!(matches!(
+            rejected,
+            Err(SecretHidingFriCommitError::Hiding(
+                HidingFriProverError::HidingBudgetExceeded { .. }
+            ))
+        ));
+
+        let (after_rejection, _after_data) = <SecretHidingPcs as
+            SecretUnivariateStarkPcsCommitter<Challenge, Challenger>>::get_opt_randomization_poly_commitment_secret(
+            &rejected_pcs,
+            [valid_domain],
+        )
+        .expect("valid guarded randomization after rejection must succeed")
+        .expect("guarded hiding PCS must produce a randomization commitment");
+        let (control, _control_data) = <SecretHidingPcs as SecretUnivariateStarkPcsCommitter<
+            Challenge,
+            Challenger,
+        >>::get_opt_randomization_poly_commitment_secret(
+            &control_pcs, [valid_domain]
+        )
+        .expect("valid guarded control randomization must succeed")
+        .expect("guarded hiding PCS must produce a randomization commitment");
+
+        assert_eq!(after_rejection, control);
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_hiding_randomization_rejects_width_overflow() {
+        let pcs = make_secret_hiding_pcs(usize::MAX);
+        let domain =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(&pcs, 32);
+
+        let result = <SecretHidingPcs as SecretUnivariateStarkPcsCommitter<
+            Challenge,
+            Challenger,
+        >>::get_opt_randomization_poly_commitment_secret(&pcs, [domain]);
+
+        assert!(matches!(
+            result,
+            Err(SecretHidingFriCommitError::Matrix(
+                SecretMatrixError::DimensionOverflow
+            ))
+        ));
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_hiding_opening_matches_standard_and_is_accepted_by_verifier() {
+        let standard_pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let guarded_pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let domain = <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(
+            &standard_pcs,
+            32,
+        );
+        let matrix = RowMajorMatrix::new((1_u8..=32).map(Val::from_u8).collect_vec(), 2);
+
+        let (ordinary_commitment, ordinary_data) =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::commit(
+                &standard_pcs,
+                [(domain, matrix.clone())],
+            )
+            .expect("valid standard hiding commitment must succeed");
+        let (commitment, mut guarded_data) =
+            <SecretHidingPcs as SecretPcsCommitter<Challenge, Challenger>>::commit_secret(
+                &guarded_pcs,
+                vec![(domain, SecretProverData::new(matrix))],
+            )
+            .expect("valid guarded hiding commitment must succeed");
+        assert_eq!(commitment, ordinary_commitment);
+
+        let mut challenger_rng = SmallRng::seed_from_u64(0x4f50_454e_5f50_4152);
+        let challenger_permutation = Perm::new_from_rng_128(&mut challenger_rng);
+        let mut ordinary_challenger = Challenger::new(challenger_permutation.clone());
+        ordinary_challenger.observe(&ordinary_commitment);
+        let ordinary_zeta: Challenge = ordinary_challenger.sample_algebra_element();
+        let (ordinary_values, ordinary_proof) =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::open(
+                &standard_pcs,
+                vec![(&ordinary_data, vec![vec![ordinary_zeta]]).into()],
+                &mut ordinary_challenger,
+            )
+            .expect("valid standard hiding opening must succeed");
+
+        let mut guarded_challenger = Challenger::new(challenger_permutation.clone());
+        guarded_challenger.observe(&commitment);
+        let zeta: Challenge = guarded_challenger.sample_algebra_element();
+        assert_eq!(zeta, ordinary_zeta);
+        let (opened_values, proof) =
+            <SecretHidingPcs as SecretPcsOpener<Challenge, Challenger>>::open_secret(
+                &guarded_pcs,
+                vec![(&mut guarded_data, vec![vec![zeta]]).into()],
+                &mut guarded_challenger,
+            )
+            .expect("valid guarded hiding opening must succeed");
+
+        assert_eq!(opened_values, ordinary_values);
+        assert_eq!(proof.0, ordinary_proof.0);
+        assert_eq!(
+            proof.1.batch_pow_witness,
+            ordinary_proof.1.batch_pow_witness
+        );
+        assert_eq!(
+            proof.1.commit_phase_commits,
+            ordinary_proof.1.commit_phase_commits
+        );
+        assert_eq!(proof.1.final_poly, ordinary_proof.1.final_poly);
+        assert_eq!(
+            guarded_challenger.sample_algebra_element::<Challenge>(),
+            ordinary_challenger.sample_algebra_element::<Challenge>()
+        );
+
+        let claims: Vec<CommitmentOpening<Challenge, Commitment, Domain>> = vec![
+            (
+                commitment,
+                vec![(domain, vec![(zeta, opened_values[0][0][0].clone())])],
+            )
+                .into(),
+        ];
+        let mut verifier_challenger = Challenger::new(challenger_permutation);
+        verifier_challenger.observe(&claims[0].commitment);
+        let verifier_zeta: Challenge = verifier_challenger.sample_algebra_element();
+        assert_eq!(verifier_zeta, zeta);
+        <SecretHidingPcs as Pcs<Challenge, Challenger>>::verify(
+            &guarded_pcs,
+            claims,
+            &proof,
+            &mut verifier_challenger,
+        )
+        .expect("ordinary hiding verifier must accept the guarded proof");
+
+        let repeated = <SecretHidingPcs as SecretPcsOpener<Challenge, Challenger>>::open_secret(
+            &guarded_pcs,
+            vec![(&mut guarded_data, vec![vec![zeta]]).into()],
+            &mut guarded_challenger,
+        );
+        assert!(matches!(
+            repeated,
+            Err(SecretHidingFriOpenError::AlreadyOpened)
+        ));
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_mixed_opening_matches_standard_verifies_and_preserves_public_data() {
+        let standard_pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let guarded_pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let domain = <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(
+            &standard_pcs,
+            32,
+        );
+        let private_matrix = RowMajorMatrix::new((1_u8..=32).map(Val::from_u8).collect_vec(), 2);
+        let public_matrix = RowMajorMatrix::new((33_u8..=48).map(Val::from_u8).collect_vec(), 1);
+
+        let (ordinary_private_commitment, ordinary_private_data) =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::commit(
+                &standard_pcs,
+                [(domain, private_matrix.clone())],
+            )
+            .expect("valid standard private commitment must succeed");
+        let (private_commitment, mut guarded_private_data) =
+            <SecretHidingPcs as SecretPcsCommitter<Challenge, Challenger>>::commit_secret(
+                &guarded_pcs,
+                vec![(domain, SecretProverData::new(private_matrix))],
+            )
+            .expect("valid guarded private commitment must succeed");
+        assert_eq!(private_commitment, ordinary_private_commitment);
+
+        let (ordinary_public_commitment, ordinary_public_data) =
+            <SecretHidingPcs as UnivariateStarkPcs<Challenge, Challenger>>::commit_preprocessing(
+                &standard_pcs,
+                [(domain, public_matrix.clone())],
+            )
+            .expect("valid standard preprocessing commitment must succeed");
+        let (public_commitment, public_data) =
+            <SecretHidingPcs as UnivariateStarkPcs<Challenge, Challenger>>::commit_preprocessing(
+                &guarded_pcs,
+                [(domain, public_matrix)],
+            )
+            .expect("valid guarded-path preprocessing commitment must succeed");
+        assert_eq!(public_commitment, ordinary_public_commitment);
+
+        let mut challenger_rng = SmallRng::seed_from_u64(0x4d49_5845_445f_5043);
+        let challenger_permutation = Perm::new_from_rng_128(&mut challenger_rng);
+        let mut ordinary_challenger = Challenger::new(challenger_permutation.clone());
+        ordinary_challenger.observe(&ordinary_private_commitment);
+        ordinary_challenger.observe(&ordinary_public_commitment);
+        let ordinary_zeta: Challenge = ordinary_challenger.sample_algebra_element();
+        let (ordinary_values, ordinary_proof) = <SecretHidingPcs as UnivariateStarkPcs<
+            Challenge,
+            Challenger,
+        >>::open_with_preprocessing(
+            &standard_pcs,
+            vec![
+                (&ordinary_private_data, vec![vec![ordinary_zeta]]).into(),
+                (&ordinary_public_data, vec![vec![ordinary_zeta]]).into(),
+            ],
+            &mut ordinary_challenger,
+            Some(1),
+        )
+        .expect("valid standard mixed opening must succeed");
+
+        let mut guarded_challenger = Challenger::new(challenger_permutation.clone());
+        guarded_challenger.observe(&private_commitment);
+        guarded_challenger.observe(&public_commitment);
+        let zeta: Challenge = guarded_challenger.sample_algebra_element();
+        assert_eq!(zeta, ordinary_zeta);
+        let (opened_values, proof) = <SecretHidingPcs as SecretPcsMixedOpener<
+            Challenge,
+            Challenger,
+        >>::open_secret_with_public_preprocessing(
+            &guarded_pcs,
+            vec![
+                SecretPcsMixedOpeningRequest::Private(
+                    (&mut guarded_private_data, vec![vec![zeta]]).into(),
+                ),
+                SecretPcsMixedOpeningRequest::Public((&public_data, vec![vec![zeta]]).into()),
+            ],
+            &mut guarded_challenger,
+        )
+        .expect("valid guarded mixed opening must succeed");
+
+        assert_eq!(opened_values, ordinary_values);
+        assert_eq!(proof.0, ordinary_proof.0);
+        assert_eq!(
+            proof.1.batch_pow_witness,
+            ordinary_proof.1.batch_pow_witness
+        );
+        assert_eq!(
+            proof.1.commit_phase_commits,
+            ordinary_proof.1.commit_phase_commits
+        );
+        assert_eq!(proof.1.final_poly, ordinary_proof.1.final_poly);
+        assert_eq!(
+            guarded_challenger.sample_algebra_element::<Challenge>(),
+            ordinary_challenger.sample_algebra_element::<Challenge>()
+        );
+
+        let claims: Vec<CommitmentOpening<Challenge, Commitment, Domain>> = vec![
+            (
+                private_commitment,
+                vec![(domain, vec![(zeta, opened_values[0][0][0].clone())])],
+            )
+                .into(),
+            (
+                public_commitment.clone(),
+                vec![(domain, vec![(zeta, opened_values[1][0][0].clone())])],
+            )
+                .into(),
+        ];
+        let mut verifier_challenger = Challenger::new(challenger_permutation.clone());
+        verifier_challenger.observe(&claims[0].commitment);
+        verifier_challenger.observe(&claims[1].commitment);
+        let verifier_zeta: Challenge = verifier_challenger.sample_algebra_element();
+        assert_eq!(verifier_zeta, zeta);
+        <SecretHidingPcs as UnivariateStarkPcs<Challenge, Challenger>>::verify_with_preprocessing(
+            &guarded_pcs,
+            claims,
+            &proof,
+            &mut verifier_challenger,
+            Some(1),
+        )
+        .expect("ordinary verifier must accept guarded mixed opening proof");
+
+        assert!(!public_data.opened.load(Ordering::Acquire));
+        let mut reuse_challenger = Challenger::new(challenger_permutation);
+        reuse_challenger.observe(&public_commitment);
+        let reuse_zeta: Challenge = reuse_challenger.sample_algebra_element();
+        <SecretHidingPcs as UnivariateStarkPcs<Challenge, Challenger>>::open_with_preprocessing(
+            &guarded_pcs,
+            vec![(&public_data, vec![vec![reuse_zeta]]).into()],
+            &mut reuse_challenger,
+            Some(0),
+        )
+        .expect("public preprocessing must remain reusable after guarded mixed opening");
+        assert!(!public_data.opened.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_mixed_opening_rejects_public_layout_before_private_consumption() {
+        let pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let domain =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(&pcs, 32);
+        let private_matrix = RowMajorMatrix::new((1_u8..=32).map(Val::from_u8).collect_vec(), 2);
+        let public_matrix = RowMajorMatrix::new(vec![Val::ONE; 16], 1);
+        let (_, mut private_data) =
+            <SecretHidingPcs as SecretPcsCommitter<Challenge, Challenger>>::commit_secret(
+                &pcs,
+                vec![(domain, SecretProverData::new(private_matrix))],
+            )
+            .expect("valid guarded private commitment must succeed");
+        let (_, mislabeled_public_data) = <SecretHidingPcs as Pcs<Challenge, Challenger>>::commit(
+            &pcs,
+            [(domain, public_matrix.clone())],
+        )
+        .expect("valid ordinary private commitment must succeed");
+        let (_, public_data) =
+            <SecretHidingPcs as UnivariateStarkPcs<Challenge, Challenger>>::commit_preprocessing(
+                &pcs,
+                [(domain, public_matrix)],
+            )
+            .expect("valid public preprocessing commitment must succeed");
+
+        let mut first_rng = SmallRng::seed_from_u64(0x4d49_5845_445f_4241);
+        let mut first_challenger = Challenger::new(Perm::new_from_rng_128(&mut first_rng));
+        let mislabeled = <SecretHidingPcs as SecretPcsMixedOpener<
+            Challenge,
+            Challenger,
+        >>::open_secret_with_public_preprocessing(
+            &pcs,
+            vec![
+                SecretPcsMixedOpeningRequest::Private(
+                    (&mut private_data, vec![vec![Challenge::ONE]]).into(),
+                ),
+                SecretPcsMixedOpeningRequest::Public(
+                    (&mislabeled_public_data, vec![vec![Challenge::ONE]]).into(),
+                ),
+            ],
+            &mut first_challenger,
+        );
+        assert!(matches!(
+            mislabeled,
+            Err(SecretHidingFriOpenError::InvalidPublicPreprocessingLayout)
+        ));
+        assert!(!private_data.opened.load(Ordering::Acquire));
+
+        let mut second_rng = SmallRng::seed_from_u64(0x4d49_5845_445f_4242);
+        let mut second_challenger = Challenger::new(Perm::new_from_rng_128(&mut second_rng));
+        let duplicated = <SecretHidingPcs as SecretPcsMixedOpener<
+            Challenge,
+            Challenger,
+        >>::open_secret_with_public_preprocessing(
+            &pcs,
+            vec![
+                SecretPcsMixedOpeningRequest::Private(
+                    (&mut private_data, vec![vec![Challenge::ONE]]).into(),
+                ),
+                SecretPcsMixedOpeningRequest::Public(
+                    (&public_data, vec![vec![Challenge::ONE]]).into(),
+                ),
+                SecretPcsMixedOpeningRequest::Public(
+                    (&public_data, vec![vec![Challenge::ONE]]).into(),
+                ),
+            ],
+            &mut second_challenger,
+        );
+        assert!(matches!(
+            duplicated,
+            Err(SecretHidingFriOpenError::InvalidPublicPreprocessingLayout)
+        ));
+        assert!(!private_data.opened.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_hiding_opening_rejects_shape_and_profile_before_consumption() {
+        let pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let domain =
+            <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(&pcs, 32);
+        let matrix = RowMajorMatrix::new((1_u8..=32).map(Val::from_u8).collect_vec(), 2);
+        let (commitment, mut prover_data) =
+            <SecretHidingPcs as SecretPcsCommitter<Challenge, Challenger>>::commit_secret(
+                &pcs,
+                vec![(domain, SecretProverData::new(matrix))],
+            )
+            .expect("valid guarded hiding commitment must succeed");
+
+        let mut challenger_rng = SmallRng::seed_from_u64(0x5052_4546_4c49_4748);
+        let mut challenger = Challenger::new(Perm::new_from_rng_128(&mut challenger_rng));
+        challenger.observe(&commitment);
+        let shape_error = <SecretHidingPcs as SecretPcsOpener<Challenge, Challenger>>::open_secret(
+            &pcs,
+            vec![(&mut prover_data, Vec::new()).into()],
+            &mut challenger,
+        );
+        assert!(matches!(
+            shape_error,
+            Err(SecretHidingFriOpenError::InvalidShape)
+        ));
+        assert!(!prover_data.opened.load(Ordering::Acquire));
+
+        prover_data.num_random_codewords = prover_data
+            .num_random_codewords
+            .checked_add(1)
+            .expect("fixed test profile increment must fit");
+        let profile_error =
+            <SecretHidingPcs as SecretPcsOpener<Challenge, Challenger>>::open_secret(
+                &pcs,
+                vec![(&mut prover_data, vec![vec![Challenge::ZERO]]).into()],
+                &mut challenger,
+            );
+        assert!(matches!(
+            profile_error,
+            Err(SecretHidingFriOpenError::RandomCodewordCountMismatch)
+        ));
+        assert!(!prover_data.opened.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_hiding_quotient_rejects_non_hiding_chunk_count_before_using_rng() {
+        const DOMAIN_SIZE: usize = 64;
+
+        let rejected_pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let control_pcs = make_secret_hiding_pcs(NUM_RANDOM_CODEWORDS);
+        let domain = <SecretHidingPcs as Pcs<Challenge, Challenger>>::natural_domain_for_degree(
+            &rejected_pcs,
+            DOMAIN_SIZE,
+        );
+        let rejected = <SecretHidingPcs as SecretUnivariateStarkPcsCommitter<
+            Challenge,
+            Challenger,
+        >>::commit_quotient_secret(
+            &rejected_pcs,
+            domain,
+            SecretProverData::new(RowMajorMatrix::new(vec![Val::ONE; DOMAIN_SIZE], 1)),
+            1,
+        );
+        assert!(matches!(
+            rejected,
+            Err(SecretHidingFriCommitError::Inner(
+                crate::SecretFriCommitError::InvalidQuotientChunkCount
+            ))
+        ));
+
+        let valid_matrix = RowMajorMatrix::new(vec![Val::TWO; DOMAIN_SIZE], 1);
+        let (after_rejection, _after_data) = <SecretHidingPcs as
+            SecretUnivariateStarkPcsCommitter<Challenge, Challenger>>::commit_quotient_secret(
+            &rejected_pcs,
+            domain,
+            SecretProverData::new(valid_matrix.clone()),
+            2,
+        )
+        .expect("valid guarded quotient after rejection must succeed");
+        let (control, _control_data) = <SecretHidingPcs as SecretUnivariateStarkPcsCommitter<
+            Challenge,
+            Challenger,
+        >>::commit_quotient_secret(
+            &control_pcs,
+            domain,
+            SecretProverData::new(valid_matrix),
+            2,
+        )
+        .expect("valid guarded control quotient must succeed");
+
+        assert_eq!(after_rejection, control);
+    }
 
     /// Run a real prover roundtrip and return `(pcs, claims, proof, challenger)`
     /// ready to verify, with `challenger` advanced past the commitment.
@@ -1331,8 +4358,7 @@ mod tests {
 
         let (mut pcs, _, _, mut challenger) = make_fixture();
         pcs.inner.fri.log_blowup = 2;
-        let original = commit_opening_fixture(&pcs);
-        let data = original.clone();
+        let data = commit_opening_fixture(&pcs);
         let mut receiver = pcs;
         change_config(&mut receiver);
         let domain = Domain::new(Val::GENERATOR, 6).unwrap();
@@ -1364,7 +4390,6 @@ mod tests {
             "every prover-data entry point must reject a mismatched hiding configuration"
         );
         assert!(!data.opened.load(Ordering::Relaxed));
-        assert!(!original.opened.load(Ordering::Relaxed));
         assert_eq!(
             challenger.sample_algebra_element::<Challenge>(),
             untouched_challenger.sample_algebra_element::<Challenge>(),
@@ -1417,6 +4442,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(not(feature = "secret-memory"))]
     #[test]
     fn open_rejects_a_matrix_without_opening_points() {
         let (pcs, _, _, mut challenger) = make_fixture();
@@ -1458,6 +4484,7 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(not(feature = "secret-memory"))]
     #[test]
     #[should_panic(expected = "already opened")]
     fn private_commitment_cannot_be_opened_twice() {

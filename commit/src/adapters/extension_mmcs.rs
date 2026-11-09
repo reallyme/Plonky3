@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::ops::Deref;
@@ -42,6 +46,8 @@ pub enum ExtensionMmcsError<E> {
     #[error("inner MMCS verification failed: {0:?}")]
     Inner(E),
 }
+#[cfg(feature = "secret-memory")]
+use crate::{SecretMmcs, SecretProverData};
 
 /// A wrapper to lift an MMCS from a base field `F` to an extension field `EF`.
 ///
@@ -54,6 +60,18 @@ pub struct ExtensionMmcs<F, EF, InnerMmcs> {
     pub(crate) inner: InnerMmcs,
 
     pub(crate) _phantom: PhantomData<(F, EF)>,
+}
+
+/// Failure while preserving guarded ownership through an extension-field MMCS adapter.
+#[cfg(feature = "secret-memory")]
+#[derive(Debug, thiserror::Error)]
+pub enum ExtensionSecretMmcsError<InnerError> {
+    /// Adapter-owned result or view metadata could not be reserved.
+    #[error("guarded extension MMCS allocation failed")]
+    AllocationFailed,
+    /// The inner base-field MMCS rejected the guarded operation.
+    #[error("guarded extension MMCS inner operation failed")]
+    Inner(InnerError),
 }
 
 impl<F, EF, InnerMmcs> ExtensionMmcs<F, EF, InnerMmcs> {
@@ -250,4 +268,103 @@ where
     EF: ExtensionField<F>,
     InnerMmcs: HidingMmcs<F>,
 {
+}
+
+#[cfg(feature = "secret-memory")]
+impl<F, EF, InnerMmcs> SecretMmcs<EF> for ExtensionMmcs<F, EF, InnerMmcs>
+where
+    F: Field + zeroize::Zeroize,
+    EF: ExtensionField<F> + zeroize::Zeroize,
+    InnerMmcs: SecretMmcs<F>,
+{
+    type SecretData<M>
+        = InnerMmcs::SecretData<FlatMatrixView<F, EF, SecretProverData<M>>>
+    where
+        M: Matrix<EF> + zeroize::Zeroize;
+    type SecretError = ExtensionSecretMmcsError<InnerMmcs::SecretError>;
+
+    fn commit_secret<M>(
+        &self,
+        inputs: Vec<SecretProverData<M>>,
+    ) -> Result<(Self::Commitment, SecretProverData<Self::SecretData<M>>), Self::SecretError>
+    where
+        M: Matrix<EF> + zeroize::Zeroize,
+    {
+        let mut flattened = Vec::new();
+        flattened
+            .try_reserve_exact(inputs.len())
+            .map_err(|_| ExtensionSecretMmcsError::AllocationFailed)?;
+        for input in inputs {
+            flattened.push(SecretProverData::new(FlatMatrixView::new(input)));
+        }
+        self.inner
+            .commit_secret(flattened)
+            .map_err(ExtensionSecretMmcsError::Inner)
+    }
+
+    fn open_batch_secret<M>(
+        &self,
+        index: usize,
+        prover_data: &SecretProverData<Self::SecretData<M>>,
+    ) -> Result<BatchOpening<EF, Self>, Self::SecretError>
+    where
+        M: Matrix<EF> + zeroize::Zeroize,
+    {
+        let (base_values, proof) = self
+            .inner
+            .open_batch_secret(index, prover_data)
+            .map_err(ExtensionSecretMmcsError::Inner)?
+            .unpack();
+        let mut extension_values = Vec::new();
+        extension_values
+            .try_reserve_exact(base_values.len())
+            .map_err(|_| ExtensionSecretMmcsError::AllocationFailed)?;
+        for base_value in base_values {
+            extension_values.push(EF::reconstitute_from_base(base_value));
+        }
+        Ok(BatchOpening::new(extension_values, proof))
+    }
+
+    fn get_matrices_secret<'a, M>(
+        &self,
+        prover_data: &'a SecretProverData<Self::SecretData<M>>,
+    ) -> Vec<&'a M>
+    where
+        M: Matrix<EF> + zeroize::Zeroize,
+    {
+        self.inner
+            .get_matrices_secret(prover_data)
+            .into_iter()
+            .map(|matrix| matrix.deref().deref())
+            .collect()
+    }
+
+    fn open_multi_batch_secret<M>(
+        &self,
+        indices: &[usize],
+        prover_data: &SecretProverData<Self::SecretData<M>>,
+    ) -> Result<(Vec<Vec<Vec<EF>>>, Self::MultiProof), Self::SecretError>
+    where
+        M: Matrix<EF> + zeroize::Zeroize,
+    {
+        let (base_values, proof) = self
+            .inner
+            .open_multi_batch_secret(indices, prover_data)
+            .map_err(ExtensionSecretMmcsError::Inner)?;
+        let mut extension_values = Vec::new();
+        extension_values
+            .try_reserve_exact(base_values.len())
+            .map_err(|_| ExtensionSecretMmcsError::AllocationFailed)?;
+        for rows in base_values {
+            let mut extension_rows = Vec::new();
+            extension_rows
+                .try_reserve_exact(rows.len())
+                .map_err(|_| ExtensionSecretMmcsError::AllocationFailed)?;
+            for row in rows {
+                extension_rows.push(EF::reconstitute_from_base(row));
+            }
+            extension_values.push(extension_rows);
+        }
+        Ok((extension_values, proof))
+    }
 }

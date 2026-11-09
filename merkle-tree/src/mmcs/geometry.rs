@@ -1,6 +1,11 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Tree geometry: height-ladder validation and width checks.
 
 use alloc::vec::Vec;
+use core::cmp::Reverse;
 
 use p3_matrix::Dimensions;
 use p3_util::log2_ceil_usize;
@@ -10,6 +15,120 @@ use crate::MerkleTreeError;
 use crate::MerkleTreeError::{
     EmptyBatch, HeightOverflow, IncompatibleHeights, WrongBatchSize, WrongWidth,
 };
+
+/// Derive the complete prover-side compression schedule from public matrix
+/// dimensions alone.
+///
+/// This is the fallible scheduling boundary shared by verification today and
+/// by a future consuming commitment builder. Keeping the schedule independent
+/// of matrix storage makes it possible to release a height group after hashing
+/// without consulting a matrix that has already been erased.
+pub(crate) fn derive_arity_schedule(
+    dimensions: &[Dimensions],
+    arity: usize,
+) -> Result<Vec<usize>, MerkleTreeError> {
+    if arity < 2 || !arity.is_power_of_two() {
+        return Err(MerkleTreeError::InvalidArity { arity });
+    }
+
+    let max_height = validate_commit_reachable_heights(dimensions.iter().map(|dims| dims.height))?;
+    let leaf_height_npt = max_height
+        .checked_next_power_of_two()
+        .ok_or(MerkleTreeError::TreeGeometryOverflow)?;
+    let mut curr_height_padded = checked_padded_len(max_height, arity)?;
+
+    let mut heights_tallest_first = Vec::new();
+    heights_tallest_first
+        .try_reserve_exact(dimensions.len())
+        .map_err(|_| MerkleTreeError::TreePlanAllocationFailed)?;
+    heights_tallest_first.extend(dimensions.iter().map(|dims| dims.height));
+    heights_tallest_first.sort_unstable_by_key(|height| Reverse(*height));
+
+    let mut cursor = 0_usize;
+    while heights_tallest_first
+        .get(cursor)
+        .is_some_and(|height| height.checked_next_power_of_two() == Some(leaf_height_npt))
+    {
+        cursor = cursor
+            .checked_add(1)
+            .ok_or(MerkleTreeError::TreeGeometryOverflow)?;
+    }
+
+    let schedule_capacity = usize::try_from(leaf_height_npt.ilog2())
+        .map_err(|_| MerkleTreeError::TreeGeometryOverflow)?;
+    let mut schedule = Vec::new();
+    schedule
+        .try_reserve_exact(schedule_capacity)
+        .map_err(|_| MerkleTreeError::TreePlanAllocationFailed)?;
+
+    while curr_height_padded > 1 {
+        let step = if curr_height_padded < arity {
+            2
+        } else {
+            let n_ary_target = (curr_height_padded / arity)
+                .checked_next_power_of_two()
+                .ok_or(MerkleTreeError::TreeGeometryOverflow)?;
+            let has_intermediate =
+                heights_tallest_first[cursor..]
+                    .iter()
+                    .try_fold(false, |found, height| {
+                        let height_npt = height
+                            .checked_next_power_of_two()
+                            .ok_or(MerkleTreeError::TreeGeometryOverflow)?;
+                        Ok::<bool, MerkleTreeError>(
+                            found || (height_npt != leaf_height_npt && height_npt > n_ary_target),
+                        )
+                    })?;
+            if has_intermediate { 2 } else { arity }
+        };
+        if schedule.len() == schedule.capacity() {
+            schedule
+                .try_reserve(1)
+                .map_err(|_| MerkleTreeError::TreePlanAllocationFailed)?;
+        }
+        schedule.push(step);
+
+        let logical_next = curr_height_padded
+            .checked_div(step)
+            .ok_or(MerkleTreeError::TreeGeometryOverflow)?;
+        curr_height_padded = checked_padded_len(logical_next, arity)?;
+
+        let logical_next_npt = logical_next
+            .checked_next_power_of_two()
+            .ok_or(MerkleTreeError::TreeGeometryOverflow)?;
+        let next_height = heights_tallest_first
+            .get(cursor)
+            .copied()
+            .filter(|height| height.checked_next_power_of_two() == Some(logical_next_npt));
+        if let Some(next_height) = next_height {
+            while heights_tallest_first.get(cursor) == Some(&next_height) {
+                cursor = cursor
+                    .checked_add(1)
+                    .ok_or(MerkleTreeError::TreeGeometryOverflow)?;
+            }
+        }
+    }
+
+    if cursor != heights_tallest_first.len() {
+        return Err(MerkleTreeError::MalformedAuthenticationData);
+    }
+    Ok(schedule)
+}
+
+fn checked_padded_len(raw_len: usize, arity: usize) -> Result<usize, MerkleTreeError> {
+    if raw_len <= 1 {
+        return Ok(raw_len);
+    }
+    if raw_len < arity {
+        return Ok(arity);
+    }
+
+    raw_len
+        .checked_add(arity - 1)
+        .map(|adjusted| adjusted / arity)
+        .and_then(|groups| groups.checked_mul(arity))
+        .ok_or(MerkleTreeError::TreeGeometryOverflow)
+}
 
 /// Check that the opened rows pair one-to-one with the committed matrices, each at its own width.
 ///
@@ -219,6 +338,33 @@ mod tests {
                 matrix: 1,
                 expected: 4,
                 got: 5,
+            })
+        ));
+    }
+
+    #[test]
+    fn arity_schedule_rejects_invalid_arity_and_unrepresentable_geometry() {
+        let dimensions = [Dimensions {
+            width: 1,
+            height: 8,
+        }];
+        assert!(matches!(
+            derive_arity_schedule(&dimensions, 1),
+            Err(MerkleTreeError::InvalidArity { arity: 1 })
+        ));
+        assert!(matches!(
+            derive_arity_schedule(&dimensions, 3),
+            Err(MerkleTreeError::InvalidArity { arity: 3 })
+        ));
+
+        let overflowing = [Dimensions {
+            width: 1,
+            height: usize::MAX,
+        }];
+        assert!(matches!(
+            derive_arity_schedule(&overflowing, 2),
+            Err(MerkleTreeError::HeightOverflow {
+                max_height: usize::MAX
             })
         ));
     }

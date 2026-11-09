@@ -1,9 +1,13 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
 use p3_field::PackedValue;
-use p3_matrix::Matrix;
+use p3_matrix::{Dimensions, Matrix};
 use p3_symmetric::{CryptographicHasher, Hash, MerkleCap, PseudoCompressionFunction};
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
@@ -64,6 +68,156 @@ pub struct MerkleTree<F, W, M, const N: usize, const DIGEST_ELEMS: usize> {
 
     /// Zero-sized marker that binds the generic `F` but occupies no space.
     _phantom: PhantomData<F>,
+}
+
+#[cfg(feature = "secret-memory")]
+impl<F, W, M, const N: usize, const DIGEST_ELEMS: usize> MerkleTree<F, W, M, N, DIGEST_ELEMS> {
+    /// Construct the erased data shell returned by detached secret commits.
+    ///
+    /// Detached commitments retain authentication data separately, so keeping
+    /// empty vectors here preserves the MMCS associated type without retaining
+    /// another copy of any witness-derived leaf or digest.
+    pub(crate) const fn detached_secret_shell() -> Self {
+        Self {
+            leaves: Vec::new(),
+            digest_layers: Vec::new(),
+            arity_schedule: Vec::new(),
+            _phantom: PhantomData,
+        }
+    }
+}
+
+/// Public authentication state retained after secret leaf matrices are erased.
+///
+/// The digest layers and arity schedule are sufficient to reconstruct Merkle
+/// authentication paths. Matrix dimensions are retained separately so a later
+/// opening can reject recomputed matrices whose shape differs from the data
+/// originally committed.
+///
+/// This type intentionally does not implement `Clone` or serialization. It is
+/// ephemeral prover state, and duplicating the full digest tree would work
+/// against the live-memory reduction this boundary is designed to provide.
+pub struct MerkleTreeAuthenticationData<F, W, const N: usize, const DIGEST_ELEMS: usize> {
+    pub(crate) dimensions: Vec<Dimensions>,
+    pub(crate) digest_layers: Vec<Vec<[W; DIGEST_ELEMS]>>,
+    pub(crate) arity_schedule: Vec<usize>,
+    pub(crate) _phantom: PhantomData<F>,
+}
+
+impl<F, W, const N: usize, const DIGEST_ELEMS: usize>
+    MerkleTreeAuthenticationData<F, W, N, DIGEST_ELEMS>
+{
+    /// Matrix shapes authenticated by this tree, in commitment order.
+    #[must_use]
+    pub fn dimensions(&self) -> &[Dimensions] {
+        &self.dimensions
+    }
+
+    /// Number of retained digest layers, including the root layer.
+    #[must_use]
+    pub const fn num_layers(&self) -> usize {
+        self.digest_layers.len()
+    }
+
+    /// Return the authenticated root without rebuilding any secret matrix.
+    pub fn try_root(&self) -> Result<Hash<F, W, DIGEST_ELEMS>, crate::MerkleTreeError>
+    where
+        W: Copy,
+    {
+        let root_layer = self
+            .digest_layers
+            .last()
+            .ok_or(crate::MerkleTreeError::MalformedAuthenticationData)?;
+        let root = root_layer
+            .first()
+            .filter(|_| root_layer.len() == 1)
+            .ok_or(crate::MerkleTreeError::MalformedAuthenticationData)?;
+        Ok((*root).into())
+    }
+
+    /// Derive the configured cap without rebuilding or cloning the full tree.
+    #[cfg(feature = "secret-memory")]
+    pub(crate) fn try_cap(
+        &self,
+        configured_cap_height: usize,
+    ) -> Result<MerkleCap<F, [W; DIGEST_ELEMS]>, crate::MerkleTreeError>
+    where
+        W: Clone,
+    {
+        let last_layer = self
+            .digest_layers
+            .len()
+            .checked_sub(1)
+            .ok_or(crate::MerkleTreeError::MalformedAuthenticationData)?;
+        let effective_cap_height = configured_cap_height.min(last_layer);
+        let layer_index = last_layer
+            .checked_sub(effective_cap_height)
+            .ok_or(crate::MerkleTreeError::MalformedAuthenticationData)?;
+        let layer = self
+            .digest_layers
+            .get(layer_index)
+            .ok_or(crate::MerkleTreeError::MalformedAuthenticationData)?;
+        let schedule = self
+            .arity_schedule
+            .get(layer_index..)
+            .ok_or(crate::MerkleTreeError::MalformedAuthenticationData)?;
+        let cap_len = schedule
+            .iter()
+            .try_fold(1_usize, |length, arity| length.checked_mul(*arity));
+        let cap_len = cap_len
+            .ok_or(crate::MerkleTreeError::TreeGeometryOverflow)?
+            .min(layer.len());
+        let cap_values = layer
+            .get(..cap_len)
+            .ok_or(crate::MerkleTreeError::MalformedAuthenticationData)?;
+        let mut cap = Vec::new();
+        cap.try_reserve_exact(cap_values.len())
+            .map_err(|_| crate::MerkleTreeError::SecretAllocationFailed)?;
+        cap.extend_from_slice(cap_values);
+        Ok(MerkleCap::new(cap))
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<F, W, const N: usize, const DIGEST_ELEMS: usize> zeroize::Zeroize
+    for MerkleTreeAuthenticationData<F, W, N, DIGEST_ELEMS>
+where
+    W: zeroize::Zeroize,
+{
+    fn zeroize(&mut self) {
+        self.dimensions.clear();
+        for layer in &mut self.digest_layers {
+            layer.zeroize();
+        }
+        self.digest_layers.clear();
+        self.arity_schedule.zeroize();
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<F, W, M, const N: usize, const DIGEST_ELEMS: usize> zeroize::Zeroize
+    for MerkleTree<F, W, M, N, DIGEST_ELEMS>
+where
+    W: zeroize::Zeroize,
+    M: zeroize::Zeroize,
+{
+    fn zeroize(&mut self) {
+        // Leaves can contain both witness-derived codewords and hiding salts.
+        // Erase them before the owning vectors release their allocations.
+        for leaf in &mut self.leaves {
+            leaf.zeroize();
+        }
+        for layer in &mut self.digest_layers {
+            for digest in layer {
+                for word in digest {
+                    word.zeroize();
+                }
+            }
+        }
+        for arity in &mut self.arity_schedule {
+            arity.zeroize();
+        }
+    }
 }
 
 impl<F: Clone + Send + Sync, W: Clone, M: Matrix<F>, const N: usize, const DIGEST_ELEMS: usize>
@@ -221,6 +375,71 @@ impl<F: Clone + Send + Sync, W: Clone, M: Matrix<F>, const N: usize, const DIGES
     #[must_use]
     pub const fn num_layers(&self) -> usize {
         self.digest_layers.len()
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<F, W, M, const N: usize, const DIGEST_ELEMS: usize> MerkleTree<F, W, M, N, DIGEST_ELEMS>
+where
+    F: Send + Sync + Clone,
+    M: Matrix<F> + zeroize::Zeroize,
+{
+    /// Retain public Merkle authentication data and erase all committed matrices.
+    ///
+    /// This is an in-place state transition so a [`SecretProverData`](p3_commit::SecretProverData)
+    /// owner can remain around the tree throughout the operation. No API exposes
+    /// or moves the secret matrices out of their zeroizing owner. After success,
+    /// this tree contains no leaves or digest layers and must not be used for an
+    /// ordinary opening; use the recomputed-opening APIs on [`MerkleTreeMmcs`](crate::MerkleTreeMmcs)
+    /// with the returned authentication data instead.
+    pub fn erase_leaves_into_authentication_data(
+        &mut self,
+    ) -> Result<MerkleTreeAuthenticationData<F, W, N, DIGEST_ELEMS>, crate::MerkleTreeError> {
+        if self.leaves.is_empty() {
+            return Err(crate::MerkleTreeError::EmptyBatch);
+        }
+
+        let mut dimensions = Vec::new();
+        dimensions
+            .try_reserve_exact(self.leaves.len())
+            .map_err(|_| crate::MerkleTreeError::SecretAllocationFailed)?;
+        dimensions.extend(self.leaves.iter().map(Matrix::dimensions));
+
+        self.erase_leaves_into_authentication_data_with_dimensions(dimensions)
+    }
+
+    /// Perform the guarded transition with dimensions allocated by an adapter.
+    ///
+    /// Hiding adapters use this after moving salt owners out of each leaf. The
+    /// replacement salt matrices preserve the committed width but intentionally
+    /// contain no rows, so the adapter supplies dimensions captured before that
+    /// ownership transition.
+    pub(crate) fn erase_leaves_into_authentication_data_with_dimensions(
+        &mut self,
+        dimensions: Vec<Dimensions>,
+    ) -> Result<MerkleTreeAuthenticationData<F, W, N, DIGEST_ELEMS>, crate::MerkleTreeError> {
+        if self.leaves.is_empty() {
+            return Err(crate::MerkleTreeError::EmptyBatch);
+        }
+        if dimensions.len() != self.leaves.len() {
+            return Err(crate::MerkleTreeError::MalformedAuthenticationData);
+        }
+
+        let digest_layers = core::mem::take(&mut self.digest_layers);
+        let arity_schedule = core::mem::take(&mut self.arity_schedule);
+
+        // Erase before clearing so the allocator never receives live witness-derived rows.
+        for leaf in &mut self.leaves {
+            leaf.zeroize();
+        }
+        self.leaves.clear();
+
+        Ok(MerkleTreeAuthenticationData {
+            dimensions,
+            digest_layers,
+            arity_schedule,
+            _phantom: PhantomData,
+        })
     }
 }
 

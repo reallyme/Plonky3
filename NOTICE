@@ -1,0 +1,14 @@
+Plonky3
+
+Original work:
+Copyright (c) 2022 The Plonky3 Authors.
+
+Modifications:
+Copyright (c) 2026 ReallyMe Technologies Limited.
+
+This distribution contains modifications related to secret-memory ownership,
+zeroizing prover paths, hiding FRI, Merkle commitments, lookup processing, and
+SHA3-384/SHA3-512 support.
+
+The software remains available under MIT OR Apache-2.0, at the recipient's
+option.

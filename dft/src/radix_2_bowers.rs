@@ -1,16 +1,26 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use alloc::vec::Vec;
 
 use p3_field::{Field, PrimeCharacteristicRing, TwoAdicField};
 use p3_matrix::Matrix;
 use p3_matrix::dense::{RowMajorMatrix, RowMajorMatrixViewMut};
+#[cfg(feature = "secret-memory")]
+use p3_matrix::secret::{ZeroizingMatrix, ZeroizingRowMajorMatrix};
 use p3_matrix::util::reverse_matrix_index_bits;
 use p3_maybe_rayon::prelude::*;
 use p3_util::{flatten_to_base, log2_strict_usize, reverse_slice_index_bits};
 use tracing::instrument;
 
 use crate::butterflies::{Butterfly, DifButterfly, DitButterfly, TwiddleFreeButterfly};
+#[cfg(feature = "secret-memory")]
+use crate::util::coset_shift_cols;
 use crate::util::divide_by_height;
 use crate::{Layout, TwoAdicSubgroupDft};
+#[cfg(feature = "secret-memory")]
+use crate::{SecretDftError, SecretTwoAdicSubgroupDft};
 
 /// The Bowers G FFT algorithm.
 /// See: "Improved Twiddle Access for Fast Fourier Transforms"
@@ -112,6 +122,350 @@ impl<F: TwoAdicField> TwoAdicSubgroupDft<F> for Radix2Bowers {
         mat = mat.bit_reversed_zero_pad(added_bits);
         bowers_g(&mut mat.as_view_mut());
         mat
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+impl<F> SecretTwoAdicSubgroupDft<F> for Radix2Bowers
+where
+    F: TwoAdicField + zeroize::Zeroize,
+{
+    fn idft_batch_secret(
+        &self,
+        matrix: &mut ZeroizingRowMajorMatrix<F>,
+    ) -> Result<(), SecretDftError> {
+        validate_secret_transform_matrix(matrix)?;
+        bowers_g_t(&mut matrix.as_view_mut());
+        divide_by_height(matrix);
+        reverse_matrix_index_bits(matrix);
+        Ok(())
+    }
+
+    fn dft_batch_secret(
+        &self,
+        matrix: &mut ZeroizingRowMajorMatrix<F>,
+    ) -> Result<(), SecretDftError> {
+        validate_secret_transform_matrix(matrix)?;
+        reverse_matrix_index_bits(matrix);
+        bowers_g(&mut matrix.as_view_mut());
+        Ok(())
+    }
+
+    fn coset_idft_batch_secret(
+        &self,
+        matrix: &mut ZeroizingRowMajorMatrix<F>,
+        shift: F,
+    ) -> Result<(), SecretDftError> {
+        self.idft_batch_secret(matrix)?;
+        coset_shift_cols(matrix, shift.inverse());
+        Ok(())
+    }
+
+    fn coset_lde_batch_secret(
+        &self,
+        matrix: &mut ZeroizingRowMajorMatrix<F>,
+        added_bits: usize,
+        shift: F,
+    ) -> Result<(), SecretDftError> {
+        let height = validate_secret_transform_matrix(matrix)?;
+
+        let log_height = log2_strict_usize(height);
+        let log_height_u64 = u64::try_from(log_height).map_err(|_| SecretDftError::SizeOverflow)?;
+        let height_inverse_subfield = F::PrimeSubfield::ONE.div_2exp_u64(log_height_u64);
+        let height_inverse = F::from_prime_subfield(height_inverse_subfield);
+
+        bowers_g_t(&mut matrix.as_view_mut());
+
+        let mut weights = shift.shifted_powers(height_inverse).collect_n(height);
+        reverse_slice_index_bits(&mut weights);
+        matrix
+            .par_rows_mut()
+            .zip(weights.into_par_iter())
+            .for_each(|(row, weight)| row.iter_mut().for_each(|element| *element *= weight));
+
+        secret_bit_reversed_zero_pad(matrix, added_bits)?;
+        bowers_g(&mut matrix.as_view_mut());
+        Ok(())
+    }
+
+    fn coset_lde_batch_secret_with_coefficients(
+        &self,
+        matrix: &mut ZeroizingRowMajorMatrix<F>,
+        added_bits: usize,
+        shift: F,
+    ) -> Result<ZeroizingRowMajorMatrix<F>, SecretDftError> {
+        self.idft_batch_secret(matrix)?;
+        coset_shift_cols(matrix, shift);
+
+        let added_bits_u32 = u32::try_from(added_bits).map_err(|_| SecretDftError::SizeOverflow)?;
+        let lde_height = matrix
+            .height()
+            .checked_shl(added_bits_u32)
+            .ok_or(SecretDftError::SizeOverflow)?;
+        let output_len = lde_height
+            .checked_mul(matrix.width)
+            .ok_or(SecretDftError::SizeOverflow)?;
+        let coefficient_len = matrix.values.len();
+        let width = matrix.width;
+
+        // Allocate the final LDE directly instead of cloning the coefficients
+        // and then growing their allocation. Keeping the original allocation
+        // as the returned coefficient owner avoids a third secret-bearing
+        // allocation at the quotient-preparation high-water mark.
+        let mut lde_values = Vec::new();
+        lde_values
+            .try_reserve_exact(output_len)
+            .map_err(|_| SecretDftError::AllocationFailed)?;
+        lde_values.resize(output_len, F::ZERO);
+        let mut lde = ZeroizingMatrix::new(RowMajorMatrix::new(lde_values, width));
+        lde.values
+            .get_mut(..coefficient_len)
+            .ok_or(SecretDftError::InvalidShape)?
+            .copy_from_slice(&matrix.values);
+
+        self.dft_batch_secret(&mut lde)?;
+        core::mem::swap(matrix, &mut lde);
+
+        // After the swap, `matrix` owns the full LDE and `lde` owns the
+        // original compact coefficient allocation.
+        let coefficients = lde;
+        Ok(coefficients)
+    }
+}
+
+#[cfg(feature = "secret-memory")]
+fn validate_secret_transform_matrix<F>(
+    matrix: &ZeroizingRowMajorMatrix<F>,
+) -> Result<usize, SecretDftError>
+where
+    F: TwoAdicField + zeroize::Zeroize,
+{
+    if matrix.width == 0 || !matrix.values.len().is_multiple_of(matrix.width) {
+        return Err(SecretDftError::InvalidShape);
+    }
+    let height = matrix.values.len() / matrix.width;
+    if height == 0 || !height.is_power_of_two() {
+        return Err(SecretDftError::InvalidHeight);
+    }
+    Ok(height)
+}
+
+#[cfg(feature = "secret-memory")]
+fn secret_bit_reversed_zero_pad<F>(
+    matrix: &mut ZeroizingRowMajorMatrix<F>,
+    added_bits: usize,
+) -> Result<(), SecretDftError>
+where
+    F: TwoAdicField + zeroize::Zeroize,
+{
+    if added_bits == 0 {
+        return Ok(());
+    }
+
+    let row_scale = 1_usize
+        .checked_shl(u32::try_from(added_bits).map_err(|_| SecretDftError::SizeOverflow)?)
+        .ok_or(SecretDftError::SizeOverflow)?;
+    let output_len = matrix
+        .values
+        .len()
+        .checked_mul(row_scale)
+        .ok_or(SecretDftError::SizeOverflow)?;
+    let width = matrix.width;
+    let mut output_values = Vec::new();
+    output_values
+        .try_reserve_exact(output_len)
+        .map_err(|_| SecretDftError::AllocationFailed)?;
+    output_values.resize(output_len, F::ZERO);
+    let mut output = ZeroizingMatrix::new(RowMajorMatrix::new(output_values, width));
+
+    output
+        .par_row_chunks_exact_mut(row_scale)
+        .zip(matrix.par_row_slices())
+        .for_each(|(mut chunk, row)| chunk.row_mut(0).copy_from_slice(row));
+
+    zeroize::Zeroize::zeroize(matrix);
+    core::mem::swap(matrix, &mut output);
+    Ok(())
+}
+
+#[cfg(all(test, feature = "secret-memory"))]
+mod secret_memory_tests {
+    use alloc::vec::Vec;
+
+    use p3_baby_bear::BabyBear;
+    use p3_field::{Field, PrimeCharacteristicRing};
+    use p3_matrix::Matrix;
+    use p3_matrix::dense::RowMajorMatrix;
+    use p3_matrix::secret::ZeroizingMatrix;
+    use p3_matrix::util::reverse_matrix_index_bits;
+
+    use super::Radix2Bowers;
+    use crate::{SecretDftError, SecretTwoAdicSubgroupDft, TwoAdicSubgroupDft};
+
+    fn fixture() -> RowMajorMatrix<BabyBear> {
+        RowMajorMatrix::new((1_u8..=8).map(BabyBear::from_u8).collect::<Vec<_>>(), 2)
+    }
+
+    #[test]
+    fn secret_coset_lde_matches_the_standard_transform() {
+        let dft = Radix2Bowers;
+        let input = fixture();
+        let expected = dft.coset_lde_batch(input.clone(), 1, BabyBear::GENERATOR);
+        let mut secret = ZeroizingMatrix::new(input);
+
+        dft.coset_lde_batch_secret(&mut secret, 1, BabyBear::GENERATOR)
+            .expect("valid fixture must transform");
+
+        assert_eq!(secret.width, expected.width);
+        assert_eq!(secret.values, expected.values);
+    }
+
+    #[test]
+    fn compact_coefficients_recompute_every_bit_reversed_lde_row() {
+        let dft = Radix2Bowers;
+        let mut lde = ZeroizingMatrix::new(fixture());
+        let compact_allocation = lde.values.as_ptr();
+        let coefficients = dft
+            .coset_lde_batch_secret_with_coefficients(&mut lde, 1, BabyBear::GENERATOR)
+            .expect("valid fixture must retain compact coefficients");
+        reverse_matrix_index_bits(&mut lde);
+
+        let indices = (0..lde.height()).collect::<Vec<_>>();
+        let recomputed = dft
+            .recompute_coset_lde_rows_secret(&coefficients, 1, &indices)
+            .expect("every committed row must be recomputable");
+
+        assert_eq!(coefficients.height() * 2, lde.height());
+        assert_eq!(coefficients.values.as_ptr(), compact_allocation);
+        assert_eq!(recomputed.width, lde.width);
+        assert_eq!(recomputed.values, lde.values);
+
+        let recomputed_full = dft
+            .recompute_coset_lde_secret(&coefficients, 1)
+            .expect("complete committed LDE must be recomputable");
+        assert_eq!(recomputed_full.width, lde.width);
+        assert_eq!(recomputed_full.values, lde.values);
+        assert!(matches!(
+            dft.recompute_coset_lde_rows_secret(&coefficients, 1, &[]),
+            Err(SecretDftError::EmptyQuerySet)
+        ));
+        let out_of_bounds_index = lde.height();
+        assert!(matches!(
+            dft.recompute_coset_lde_rows_secret(&coefficients, 1, &[out_of_bounds_index]),
+            Err(SecretDftError::QueryIndexOutOfBounds { index, height })
+                if index == out_of_bounds_index && height == out_of_bounds_index
+        ));
+    }
+
+    #[test]
+    fn complete_lde_reconstruction_rejects_malformed_coefficients() {
+        let dft = Radix2Bowers;
+        let zero_width = ZeroizingMatrix::new(RowMajorMatrix::new(Vec::<BabyBear>::new(), 0));
+        assert!(matches!(
+            dft.recompute_coset_lde_secret(&zero_width, 1),
+            Err(SecretDftError::InvalidShape)
+        ));
+
+        let invalid_height = ZeroizingMatrix::new(RowMajorMatrix::new(
+            (0..6).map(|_| BabyBear::ONE).collect::<Vec<_>>(),
+            2,
+        ));
+        assert!(matches!(
+            dft.recompute_coset_lde_secret(&invalid_height, 1),
+            Err(SecretDftError::InvalidHeight)
+        ));
+    }
+
+    #[test]
+    fn secret_forward_and_inverse_transforms_match_standard_transforms() {
+        let dft = Radix2Bowers;
+        let input = fixture();
+        let expected_evaluations = dft.dft_batch(input.clone());
+        let mut secret = ZeroizingMatrix::new(input.clone());
+
+        dft.dft_batch_secret(&mut secret)
+            .expect("valid fixture must support guarded DFT");
+        assert_eq!(secret.width, expected_evaluations.width);
+        assert_eq!(secret.values, expected_evaluations.values);
+
+        dft.idft_batch_secret(&mut secret)
+            .expect("valid fixture must support guarded inverse DFT");
+        assert_eq!(secret.width, input.width);
+        assert_eq!(secret.values, input.values);
+    }
+
+    #[test]
+    fn secret_coset_inverse_transform_matches_standard_transform() {
+        let dft = Radix2Bowers;
+        let input = fixture();
+        let expected = dft.coset_idft_batch(input.clone(), BabyBear::GENERATOR);
+        let mut secret = ZeroizingMatrix::new(input);
+
+        dft.coset_idft_batch_secret(&mut secret, BabyBear::GENERATOR)
+            .expect("valid fixture must support guarded coset inverse DFT");
+
+        assert_eq!(secret.width, expected.width);
+        assert_eq!(secret.values, expected.values);
+    }
+
+    #[test]
+    fn secret_transforms_reject_zero_width_without_releasing_the_owner() {
+        let dft = Radix2Bowers;
+        let mut malformed = fixture();
+        malformed.width = 0;
+        let expected_values = malformed.values.clone();
+        let mut secret = ZeroizingMatrix::new(malformed);
+
+        let result = dft.dft_batch_secret(&mut secret);
+
+        assert_eq!(result, Err(SecretDftError::InvalidShape));
+        assert_eq!(secret.values, expected_values);
+        assert_eq!(secret.width, 0);
+    }
+
+    #[test]
+    fn secret_coset_lde_rejects_invalid_height_without_releasing_the_owner() {
+        let dft = Radix2Bowers;
+        let mut secret = ZeroizingMatrix::new(RowMajorMatrix::new(Vec::<BabyBear>::new(), 1));
+
+        let result = dft.coset_lde_batch_secret(&mut secret, 1, BabyBear::GENERATOR);
+
+        assert_eq!(result, Err(SecretDftError::InvalidHeight));
+        assert!(secret.values.is_empty());
+    }
+
+    #[test]
+    fn secret_coset_lde_rejects_output_size_overflow() {
+        let dft = Radix2Bowers;
+        let mut secret = ZeroizingMatrix::new(fixture());
+
+        let oversized_shift =
+            usize::try_from(usize::BITS).expect("usize bit width must fit in usize");
+        let result = dft.coset_lde_batch_secret(&mut secret, oversized_shift, BabyBear::GENERATOR);
+
+        assert_eq!(result, Err(SecretDftError::SizeOverflow));
+    }
+
+    #[test]
+    fn coefficient_retaining_lde_overflow_preserves_the_guarded_allocation() {
+        let dft = Radix2Bowers;
+        let mut secret = ZeroizingMatrix::new(fixture());
+        let guarded_allocation = secret.values.as_ptr();
+        let original_len = secret.values.len();
+        let original_width = secret.width;
+        let oversized_shift =
+            usize::try_from(usize::BITS).expect("usize bit width must fit in usize");
+
+        let result = dft.coset_lde_batch_secret_with_coefficients(
+            &mut secret,
+            oversized_shift,
+            BabyBear::GENERATOR,
+        );
+
+        assert!(matches!(result, Err(SecretDftError::SizeOverflow)));
+        assert_eq!(secret.values.as_ptr(), guarded_allocation);
+        assert_eq!(secret.values.len(), original_len);
+        assert_eq!(secret.width, original_width);
     }
 }
 

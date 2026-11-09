@@ -1,3 +1,7 @@
+# Modified by ReallyMe Technologies Limited, 2026.
+# SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "p3-merkle-tree"
 description = "A Merkle tree implementation providing commitment scheme functionality for cryptographic proofs."
@@ -11,6 +15,13 @@ categories.workspace = true
 
 [features]
 parallel = ["p3-maybe-rayon/parallel"]
+secret-memory = [
+    "dep:zeroize",
+    "p3-commit/secret-memory",
+    "p3-field/secret-memory",
+    "p3-matrix/secret-memory",
+    "p3-symmetric/secret-memory",
+]
 
 [dependencies]
 p3-commit.workspace = true
@@ -26,9 +37,10 @@ serde = { workspace = true, features = ["alloc"] }
 spin.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
-p3-baby-bear = { path = "../baby-bear" }
+p3-baby-bear = { path = "../baby-bear", features = ["secret-memory"] }
 p3-blake2s = { path = "../blake2s" }
 p3-blake3 = { path = "../blake3" }
 p3-goldilocks = { path = "../goldilocks" }

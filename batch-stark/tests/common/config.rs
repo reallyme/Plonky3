@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Deterministic backend configurations shared by the batch contract tests.
 
 use core::marker::PhantomData;
@@ -6,6 +10,8 @@ use p3_baby_bear::{BabyBear, Poseidon2BabyBear};
 use p3_challenger::{DuplexChallenger, HashChallenger, SerializingChallenger32};
 use p3_circle::CirclePcs;
 use p3_commit::ExtensionMmcs;
+#[cfg(feature = "secret-memory")]
+use p3_dft::Radix2Bowers;
 use p3_dft::Radix2DitParallel;
 use p3_field::Field;
 use p3_field::extension::BinomialExtensionField;
@@ -53,6 +59,14 @@ type HidingPcs = HidingFriPcs<Val, Dft, HidingValMmcs, HidingChallengeMmcs, StdR
 pub(super) type MyConfig = StarkConfig<MyPcs, Challenge, Challenger>;
 pub(super) type MyConfigWide = StarkConfig<MyPcsWide, Challenge, Challenger>;
 pub(super) type MyHidingConfig = StarkConfig<HidingPcs, Challenge, Challenger>;
+#[cfg(feature = "secret-memory")]
+type SecretPcs = TwoAdicFriPcs<Val, Radix2Bowers, ValMmcs, ChallengeMmcs>;
+#[cfg(feature = "secret-memory")]
+pub(super) type SecretConfig = StarkConfig<SecretPcs, Challenge, Challenger>;
+#[cfg(feature = "secret-memory")]
+type SecretHidingPcs = HidingFriPcs<Val, Radix2Bowers, HidingValMmcs, HidingChallengeMmcs, StdRng>;
+#[cfg(feature = "secret-memory")]
+pub(super) type SecretHidingConfig = StarkConfig<SecretHidingPcs, Challenge, Challenger>;
 
 pub(super) fn make_config(seed: u64) -> MyConfig {
     let mut rng = SmallRng::seed_from_u64(seed);
@@ -65,6 +79,41 @@ pub(super) fn make_config(seed: u64) -> MyConfig {
     let fri_params = FriParameters::new_testing(challenge_mmcs, 2);
     let pcs = MyPcs::new(dft, val_mmcs, fri_params);
     let challenger = Challenger::new(perm);
+    StarkConfig::new(pcs, challenger)
+}
+
+#[cfg(feature = "secret-memory")]
+pub(super) fn make_secret_config(seed: u64) -> SecretConfig {
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let permutation = Perm::new_from_rng_128(&mut rng);
+    let hash = MyHash::new(permutation.clone());
+    let compress = MyCompress::new(permutation.clone());
+    let value_mmcs = ValMmcs::new(hash, compress, 0);
+    let challenge_mmcs = ChallengeMmcs::new(value_mmcs.clone());
+    let fri_parameters = FriParameters::new_testing(challenge_mmcs, 2);
+    let pcs = SecretPcs::new(Radix2Bowers, value_mmcs, fri_parameters);
+    let challenger = Challenger::new(permutation);
+    StarkConfig::new(pcs, challenger)
+}
+
+#[cfg(feature = "secret-memory")]
+pub(super) fn make_secret_hiding_config(seed: u64) -> SecretHidingConfig {
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let permutation = Perm::new_from_rng_128(&mut rng);
+    let hash = MyHash::new(permutation.clone());
+    let compress = MyCompress::new(permutation.clone());
+    let value_mmcs =
+        HidingValMmcs::new(hash, compress, 2, StdRng::seed_from_u64(seed ^ 0x4d4d_4353));
+    let challenge_mmcs = HidingChallengeMmcs::new(value_mmcs.clone());
+    let fri_parameters = FriParameters::new_testing(challenge_mmcs, 2);
+    let pcs = SecretHidingPcs::new(
+        Radix2Bowers,
+        value_mmcs,
+        fri_parameters,
+        4,
+        StdRng::seed_from_u64(seed ^ 0x4652_4952),
+    );
+    let challenger = Challenger::new(permutation);
     StarkConfig::new(pcs, challenger)
 }
 

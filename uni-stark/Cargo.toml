@@ -1,3 +1,7 @@
+# Modified by ReallyMe Technologies Limited, 2026.
+# SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "p3-uni-stark"
 description = "A minimal univariate STARK framework providing core components for proof generation and verification."
@@ -11,6 +15,7 @@ categories.workspace = true
 
 [features]
 parallel = ["p3-maybe-rayon/parallel"]
+secret-memory = ["dep:zeroize", "p3-field/secret-memory"]
 
 [dependencies]
 p3-air.workspace = true
@@ -26,6 +31,7 @@ itertools.workspace = true
 serde = { workspace = true, features = ["derive", "alloc"] }
 thiserror.workspace = true
 tracing.workspace = true
+zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
 p3-baby-bear = { path = "../baby-bear" }

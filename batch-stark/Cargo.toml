@@ -1,3 +1,7 @@
+# Modified by ReallyMe Technologies Limited, 2026.
+# SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "p3-batch-stark"
 description = "Batched STARK wrapper atop p3-uni-stark that reuses FRI openings across instances."
@@ -11,6 +15,14 @@ categories.workspace = true
 
 [features]
 parallel = ["p3-maybe-rayon/parallel"]
+secret-memory = [
+    "p3-commit/secret-memory",
+    "p3-field/secret-memory",
+    "p3-lookup/secret-memory",
+    "p3-matrix/secret-memory",
+    "p3-uni-stark/secret-memory",
+    "dep:zeroize",
+]
 
 [dependencies]
 p3-air.workspace = true
@@ -22,6 +34,7 @@ p3-matrix.workspace = true
 p3-maybe-rayon.workspace = true
 p3-uni-stark.workspace = true
 p3-util.workspace = true
+zeroize = { workspace = true, optional = true }
 
 hashbrown.workspace = true
 serde = { workspace = true, features = ["derive", "alloc"] }
@@ -29,15 +42,15 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-p3-baby-bear = { path = "../baby-bear" }
+p3-baby-bear = { path = "../baby-bear", features = ["secret-memory"] }
 p3-challenger = { path = "../challenger", features = ["test-utils"] }
 p3-circle = { path = "../circle" }
 p3-commit = { path = "../commit" }
-p3-dft = { path = "../dft" }
-p3-fri = { path = "../fri" }
+p3-dft = { path = "../dft", features = ["secret-memory"] }
+p3-fri = { path = "../fri", features = ["secret-memory"] }
 p3-keccak = { path = "../keccak" }
 p3-matrix = { path = "../matrix" }
-p3-merkle-tree = { path = "../merkle-tree" }
+p3-merkle-tree = { path = "../merkle-tree", features = ["secret-memory"] }
 p3-mersenne-31 = { path = "../mersenne-31" }
 p3-security = { path = "../security" }
 p3-symmetric = { path = "../symmetric" }

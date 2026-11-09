@@ -1,3 +1,7 @@
+<!-- Modified by ReallyMe Technologies Limited, 2026. -->
+<!-- SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited -->
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+
 # Changelog
 
 All notable changes to this project will be documented in this file.
@@ -6,6 +10,91 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- Add guarded two-adic, quotient, and hiding-FRI commitment construction with erasable retained
+  LDEs.
+- Retain guarded compact coefficients in the two-adic PCS so ordinary trace and masked quotient
+  commitments can reconstruct only verifier-selected LDE rows after full Merkle leaves are erased.
+- Add a typed PCS bridge that preserves mixed-height MMCS index semantics while reconstructing,
+  detaching, and authenticating selected rows, plus a FRI driver boundary that defers input
+  openings until Fiat-Shamir query indices are fixed.
+- Add guarded FRI folding and commit-phase construction. Fold outputs and multi-round scratch
+  storage are guarded before their first secret-derived write, while every committed extension
+  codeword remains owned by a zeroizing MMCS data wrapper.
+- Add guarded terminal-polynomial conversion and commit-layer query answering. The inverse DFT
+  stays behind zeroizing extension- and base-field owners until the protocol-public coefficients
+  are copied out, and query answering consumes and erases every retained MMCS layer.
+- Add a complete guarded FRI driver with typed preflight, explicit transcript abort on fallible
+  phase errors, non-panicking transcript finalization, and deferred input openings after
+  Fiat-Shamir fixes the query indices.
+- Add a complete guarded two-adic PCS opening path. Interpolation, quotient reduction, FRI
+  folding, deferred input reconstruction, and Merkle authentication preserve zeroizing ownership;
+  generated proofs are accepted by the ordinary verifier.
+- Expose that guarded two-adic opening path through the protocol-level `SecretPcsOpener`
+  capability with stable public failure categories.
+- Implement guarded one-shot opening for hiding FRI commitments, including profile, shape, and
+  disclosure-budget validation before consumption and ordinary-verifier proof parity.
+- Add guarded two-adic domain evaluation from retained coefficients, including hiding-FRI profile
+  validation and zeroizing removal of random codeword columns.
+- Recover exact pre-randomization hiding-FRI source traces by reconstructing the committed domain,
+  removing random codeword columns, and consuming the interleaved masking rows under zeroizing
+  ownership. Domain-shape mismatches fail with typed errors.
+- Stream hiding quotient masks one chunk at a time while retaining only the final constrained mask
+  accumulator. Quotient sources are erased immediately after guarded chunk distribution, before
+  randomization, coefficient retention, and LDE expansion. Commitment and post-commitment RNG
+  parity remain identical to the ordinary path.
+- Detach transparent and hiding quotient value leaves immediately after their global commitment is
+  fixed. Compact coefficients provide checked opening geometry, while digest layers and hiding
+  salts remain in authentication-only state for transcript-selected queries. Guarded opening now
+  accepts this pre-detached state without changing commitments, proof bytes, or verifier behavior.
+- Add an explicit guarded MMCS operation that returns authentication-only state as part of
+  commitment construction. Transparent and hiding quotient commitments now use this single
+  transition, with tests pinning source erasure, recomputed-row verification, hiding-salt parity,
+  and unchanged hiding-RNG consumption. The default implementation composes the existing commit
+  and detach operations so optimized MMCS implementations can later release matrices during tree
+  construction without changing the PCS boundary.
+- Add guarded hiding-FRI randomization-polynomial commitments. Generated evaluations enter a
+  zeroizing owner before their first random write, and all domain budgets are validated before the
+  prover RNG advances.
+- Add mixed guarded PCS opening for transparent and hiding FRI. Public preprocessing remains
+  reusable under ordinary immutable ownership while private value leaves are detached before
+  quotient reduction; authentication data remains available for the later transcript-selected
+  queries.
+- Add guarded multi-instance quotient commitment for transparent and hiding FRI, retaining one
+  global commitment root while validating every instance before transformation or hiding-RNG use.
+- Add planned quotient generation for transparent and hiding FRI. Public geometry is preflighted
+  before generation or RNG use, each contiguous quotient is released after chunk transformation,
+  and the resulting LDEs retain the original single-root order.
+- Add matrix-scoped reconstruction of complete committed LDEs from guarded retained coefficients,
+  including exact parity before and after Merkle value-leaf detachment.
+- Stream guarded trace masking, LDE construction, and recomputable MMCS absorption one matrix at a
+  time, returning already-detached authentication state. Complete batch geometry is rejected
+  before masking RNG use. Tests pin commitment, opening, verifier, and hiding-RNG parity with the
+  retained commitment path.
+
+### Changed
+- Reduce the two-adic PCS opening live set by fusing row compression with opening-quotient
+  accumulation and releasing interpolation and denominator tables at their final consumers.
+- Factor interpolation and quotient reduction into an owned prepared-opening state. The ordinary
+  PCS path now ends every committed-matrix borrow before FRI query selection, establishing the
+  lifetime boundary required for guarded detachment without changing proof or verifier types.
+- Route ordinary FRI input openings through the deferred opener used by the guarded path, keeping
+  transcript order and proof wire types identical.
+- Preserve ordinary commitments, folding challenges, final-polynomial values, and opening proofs
+  across guarded FRI commit construction, with typed shape and allocation failures.
+- Preserve ordinary final-polynomial bytes, query indices, sibling values, and pruned Merkle
+  multiproofs across the guarded terminal and query boundaries.
+- Route ordinary and guarded PCS openings through one reduction implementation with explicit
+  storage and interpolation policies, rejecting unsupported opening points before transcript
+  mutation and aborting incomplete transcripts on typed failures.
+- Split claimed-opening interpolation from quotient reduction. Guarded openings now release every
+  committed-matrix borrow, validate geometry, detach full private value leaves, and evaluate claims
+  directly from retained coefficients before reconstructing, reducing, and erasing one private LDE
+  matrix at a time. Independent interpolation, proof-component, and challenger-state tests preserve
+  the transcript and proof format exactly.
+- Distinguish typed input-detachment failures from failures reconstructing an already-detached
+  matrix during guarded opening reduction.
+
 ## [0.8.0] - 2026-09-23
 ### Merged PRs
 - Perf(fri): closed-form fold_row, in-place fold_matrix, hoisted verifier alpha ladder, fused hiding LDE (#2015)
@@ -126,4 +215,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Skylar Ray
 - Thomas Coratger
 - Zach Langley
-

@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Core LogUp Implementation
 //!
 //! ## Mathematical Foundation
@@ -47,7 +51,7 @@ pub type RowEvalContext<'a, F, EF> = LookupTraceBuilder<'a, F, EF>;
 /// - Those powers run `beta^{k-1}` down to `beta^1`, taken from `beta_powers[1..k]` reversed.
 /// - The product is extension times base, cheaper than the extension times extension a Horner fold uses.
 /// - This folding convention matches the symbolic side, so prover and verifier agree on the combined value.
-fn combine_tuple<F: Field, EF: ExtensionField<F>>(
+pub(crate) fn combine_tuple<F: Field, EF: ExtensionField<F>>(
     elts: &[SymbolicExpression<F>],
     beta_powers: &[EF],
     row_ctx: &RowEvalContext<'_, F, EF>,
@@ -482,6 +486,7 @@ impl LookupProtocol for LogUpGadget {
         }
 
         let height = main.height();
+
         let num_lookups = lookups.len();
         // One accumulator column at index 0, then one fraction column per lookup.
         let width = num_lookups + 1;
@@ -618,7 +623,6 @@ impl LookupProtocol for LogUpGadget {
                 // Thread-local denominator and multiplicity buffers.
                 let mut local_denoms = EF::zero_vec(num_rows * denoms_per_row);
                 let mut local_mults = F::zero_vec(num_rows * denoms_per_row);
-
                 // Phase 1: Fill denominators and multiplicities for every row in this chunk.
                 for local_i in 0..num_rows {
                     let i = start_row + local_i;

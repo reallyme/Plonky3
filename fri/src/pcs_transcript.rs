@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Fiat-Shamir transcript of the FRI polynomial commitment scheme.
 //!
 //! # Overview
@@ -293,6 +297,18 @@ pub struct PcsProverTranscript<'a, C, F: PrimeField64, EF> {
     _ef: PhantomData<EF>,
 }
 
+/// Failure while closing a fallible guarded PCS prover transcript.
+#[cfg(feature = "secret-memory")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub(crate) enum SecretPcsProverTranscriptError {
+    /// The driver did not replay every interaction described by the PCS shape.
+    #[error("guarded PCS transcript is incomplete")]
+    Incomplete { remaining: usize },
+    /// The PCS unexpectedly emitted standalone transcript wire bytes.
+    #[error("guarded PCS transcript emitted unexpected wire data")]
+    UnexpectedWireData,
+}
+
 impl<'a, C, F, EF> PcsProverTranscript<'a, C, F, EF>
 where
     F: PrimeField64,
@@ -368,6 +384,22 @@ where
             self.state.finalize().is_empty(),
             "the PCS carries every value in its own proof",
         );
+    }
+
+    /// Close a guarded PCS transcript without a panic-based completeness path.
+    #[cfg(feature = "secret-memory")]
+    pub(crate) fn finish_secret(mut self) -> Result<(), SecretPcsProverTranscriptError> {
+        let remaining = self.state.remaining_interactions();
+        if remaining != 0 {
+            self.state.abort();
+            return Err(SecretPcsProverTranscriptError::Incomplete { remaining });
+        }
+
+        if self.state.finalize().is_empty() {
+            Ok(())
+        } else {
+            Err(SecretPcsProverTranscriptError::UnexpectedWireData)
+        }
     }
 }
 
@@ -747,6 +779,19 @@ mod tests {
                 expected: 2,
                 got: 3
             }
+        );
+    }
+
+    #[cfg(feature = "secret-memory")]
+    #[test]
+    fn guarded_prover_finalization_reports_an_incomplete_transcript_without_panicking() {
+        let mut challenger = fresh_challenger();
+        let transcript =
+            PcsProverTranscript::<Ch, F, EF>::new(&mut challenger, shape_with(vec![vec![vec![1]]]));
+
+        assert_eq!(
+            transcript.finish_secret(),
+            Err(SecretPcsProverTranscriptError::Incomplete { remaining: 4 })
         );
     }
 

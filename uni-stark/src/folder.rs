@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use alloc::vec::Vec;
 
 use p3_air::{AirBuilder, ExtensionBuilder, RowWindow};
@@ -57,6 +61,21 @@ pub struct ProverConstraintFolder<'a, SC: StarkGenericConfig> {
     pub constraint_index: usize,
     /// Total number of constraints in the AIR (debug-only bookkeeping)
     pub constraint_count: usize,
+}
+
+#[cfg(feature = "secret-memory")]
+impl<SC> zeroize::Zeroize for ProverConstraintFolder<'_, SC>
+where
+    SC: StarkGenericConfig,
+    PackedVal<SC>: zeroize::Zeroize,
+    PackedChallenge<SC>: zeroize::Zeroize,
+{
+    fn zeroize(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.base_constraints);
+        zeroize::Zeroize::zeroize(&mut self.ext_constraints);
+        self.constraint_index = 0;
+        self.constraint_count = 0;
+    }
 }
 
 /// Packed constraint folder evaluating `N` packed vectors per constraint in lockstep.

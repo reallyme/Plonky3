@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Fiat-Shamir transcript of the FRI low-degree test.
 //!
 //! # Overview
@@ -299,6 +303,23 @@ pub struct ProverTranscript<'a, C, F: PrimeField64, EF> {
     _ef: PhantomData<EF>,
 }
 
+/// Failure while closing a fallible prover-side FRI transcript.
+///
+/// The ordinary transcript API retains its strict panic-on-programmer-bug
+/// contract. Guarded proving uses this typed boundary because an error must be
+/// allowed to unwind through secret-owning buffers without a second panic from
+/// the transcript's drop check.
+#[cfg(feature = "secret-memory")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub(crate) enum SecretProverTranscriptError {
+    /// The driver did not replay every interaction described by the FRI shape.
+    #[error("guarded FRI transcript is incomplete")]
+    Incomplete { remaining: usize },
+    /// FRI unexpectedly emitted standalone transcript wire bytes.
+    #[error("guarded FRI transcript emitted unexpected wire data")]
+    UnexpectedWireData,
+}
+
 impl<'a, C, F, EF> ProverTranscript<'a, C, F, EF>
 where
     F: PrimeField64,
@@ -375,6 +396,32 @@ where
             self.state.finalize().is_empty(),
             "FRI carries every value in its own proof",
         );
+    }
+
+    /// Abort a fallible FRI run after releasing the transcript drop check.
+    ///
+    /// The challenger is intentionally not rolled back: once a transcript has
+    /// absorbed proof material, a caller must discard the failed proving
+    /// session rather than attempt to reuse its Fiat-Shamir state.
+    #[cfg(feature = "secret-memory")]
+    pub(crate) fn abort(&mut self) {
+        self.state.abort();
+    }
+
+    /// Close a guarded FRI transcript without a panic-based completeness path.
+    #[cfg(feature = "secret-memory")]
+    pub(crate) fn finish_secret(mut self) -> Result<(), SecretProverTranscriptError> {
+        let remaining = self.state.remaining_interactions();
+        if remaining != 0 {
+            self.state.abort();
+            return Err(SecretProverTranscriptError::Incomplete { remaining });
+        }
+
+        if self.state.finalize().is_empty() {
+            Ok(())
+        } else {
+            Err(SecretProverTranscriptError::UnexpectedWireData)
+        }
     }
 }
 
@@ -914,6 +961,20 @@ mod tests {
         assert_eq!(
             payload.downcast_ref::<&str>().copied(),
             Some("folding strategy panicked")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "secret-memory")]
+    fn guarded_finalization_returns_typed_incomplete_error_without_panicking() {
+        let mut challenger = fresh_challenger();
+        let transcript = ProverTranscript::<Ch, F, EF>::new(&mut challenger, shape_with(vec![1]));
+
+        let result = transcript.finish_secret();
+
+        assert_eq!(
+            result,
+            Err(SecretProverTranscriptError::Incomplete { remaining: 4 })
         );
     }
 

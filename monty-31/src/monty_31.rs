@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! An abstraction of 31-bit fields which use a MONTY approach for faster multiplication.
 
 use alloc::vec;
@@ -41,6 +45,13 @@ pub struct MontyField31<MP: MontyParameters> {
     /// likely doing something fishy.
     pub(crate) value: u32,
     _phantom: PhantomData<MP>,
+}
+
+#[cfg(feature = "secret-memory")]
+impl<MP: MontyParameters> zeroize::Zeroize for MontyField31<MP> {
+    fn zeroize(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.value);
+    }
 }
 
 impl<MP: MontyParameters> MontyField31<MP> {

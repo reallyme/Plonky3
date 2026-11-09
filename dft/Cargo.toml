@@ -1,3 +1,7 @@
+# Modified by ReallyMe Technologies Limited, 2026.
+# SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "p3-dft"
 description = "A collection of discrete Fourier transform (DFT) implementations for finite fields."
@@ -11,6 +15,12 @@ categories.workspace = true
 
 [features]
 parallel = ["p3-maybe-rayon/parallel"]
+secret-memory = [
+    "dep:thiserror",
+    "dep:zeroize",
+    "p3-field/secret-memory",
+    "p3-matrix/secret-memory",
+]
 
 [dependencies]
 p3-field.workspace = true
@@ -20,10 +30,12 @@ p3-util.workspace = true
 
 itertools.workspace = true
 spin.workspace = true
+thiserror = { workspace = true, optional = true }
 tracing.workspace = true
+zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
-p3-baby-bear = { path = "../baby-bear" }
+p3-baby-bear = { path = "../baby-bear", features = ["secret-memory"] }
 p3-goldilocks = { path = "../goldilocks" }
 p3-mersenne-31 = { path = "../mersenne-31" }
 p3-monty-31 = { path = "../monty-31" }

@@ -1,3 +1,7 @@
+// Modified by ReallyMe Technologies Limited, 2026.
+// SPDX-FileCopyrightText: 2026 ReallyMe Technologies Limited
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Error types raised while committing, opening, or verifying a Merkle MMCS.
 
 use thiserror::Error;
@@ -6,6 +10,83 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum MerkleTreeError {
+    /// A Merkle arity cannot define a valid compression tree.
+    #[error("Merkle arity {arity} must be a power of two greater than one")]
+    InvalidArity {
+        /// Invalid compression arity.
+        arity: usize,
+    },
+
+    /// Merkle layer dimensions cannot be represented by `usize`.
+    #[error("Merkle tree geometry overflows the platform index width")]
+    TreeGeometryOverflow,
+
+    /// The fallible Merkle scheduling allocation could not be reserved.
+    #[error("Merkle tree schedule allocation failed")]
+    TreePlanAllocationFailed,
+
+    /// Packed leaf values and packed digest words cannot share a SIMD schedule.
+    #[error(
+        "Merkle packing width mismatch: leaf packing is {leaf_width}, digest packing is {digest_width}"
+    )]
+    PackingWidthMismatch {
+        /// Number of scalar leaf values in one packed leaf value.
+        leaf_width: usize,
+        /// Number of scalar digest words in one packed digest word.
+        digest_width: usize,
+    },
+
+    /// A guarded matrix or salt buffer length cannot be represented.
+    #[error("secret commitment dimensions overflow")]
+    SecretDimensionOverflow,
+
+    /// A guarded commitment buffer could not be reserved.
+    #[error("secret commitment allocation failed")]
+    SecretAllocationFailed,
+
+    /// Recomputed opening buffers could not be reserved.
+    #[error("recomputed Merkle opening allocation failed")]
+    RecomputedOpeningAllocationFailed,
+
+    /// A hiding commitment requested no salt elements per row.
+    #[error("secret hiding commitment requires at least one salt element")]
+    SecretInvalidSaltWidth,
+
+    /// A streaming commitment received too few or too many matrices.
+    #[error("streaming commitment expected {expected} matrices, got {got}")]
+    StreamedMatrixCountMismatch {
+        /// Matrix count declared before secret absorption began.
+        expected: usize,
+        /// Matrix count supplied so far.
+        got: usize,
+    },
+
+    /// A streamed matrix does not match its predeclared shape.
+    #[error(
+        "streamed matrix {matrix} has shape {got_width}x{got_height}; expected {expected_width}x{expected_height}"
+    )]
+    StreamedMatrixShapeMismatch {
+        /// Matrix position in commitment order.
+        matrix: usize,
+        /// Width declared before secret absorption began.
+        expected_width: usize,
+        /// Height declared before secret absorption began.
+        expected_height: usize,
+        /// Width supplied by the streamed matrix.
+        got_width: usize,
+        /// Height supplied by the streamed matrix.
+        got_height: usize,
+    },
+
+    /// A shape-checked streamed matrix failed to return one of its rows.
+    #[error("streamed matrix {matrix} does not contain required row {row}")]
+    StreamedRowUnavailable {
+        /// Matrix position in commitment order.
+        matrix: usize,
+        /// Row required by the predeclared matrix height.
+        row: usize,
+    },
+
     /// The number of openings provided does not match the expected number.
     #[error("batch size mismatch: expected {expected} entries, got {got}")]
     WrongBatchSize {
@@ -91,6 +172,36 @@ pub enum MerkleTreeError {
     HeightOverflow {
         /// Height of the tallest matrix in the batch.
         max_height: usize,
+    },
+
+    /// Recomputed matrices do not have the same shape as the committed matrices.
+    #[error(
+        "recomputed matrix {matrix} has shape {got_width}x{got_height}; expected {expected_width}x{expected_height}"
+    )]
+    RecomputedMatrixShapeMismatch {
+        /// Index of the offending matrix in commitment order.
+        matrix: usize,
+        /// Committed matrix width.
+        expected_width: usize,
+        /// Committed matrix height.
+        expected_height: usize,
+        /// Recomputed matrix width.
+        got_width: usize,
+        /// Recomputed matrix height.
+        got_height: usize,
+    },
+
+    /// Retained authentication data is internally inconsistent.
+    #[error("Merkle authentication data is malformed")]
+    MalformedAuthenticationData,
+
+    /// A row expected from a shape-checked recomputed matrix was unavailable.
+    #[error("recomputed matrix {matrix} does not contain required row {row}")]
+    RecomputedRowUnavailable {
+        /// Index of the matrix in commitment order.
+        matrix: usize,
+        /// Row required by the global query index.
+        row: usize,
     },
 
     /// The computed Merkle digest does not match any entry in the cap.
